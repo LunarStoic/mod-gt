@@ -14,7 +14,7 @@ use crate::protocol::packet::{self, GamePacketType, GameUpdatePacket, IncomingPa
 use crate::player::{LocalPlayer, Player, parse_pipe_map};
 use crate::server_data::{LoginInfo, get_server_data_proxied};
 use crate::socks5::Socks5UdpSocket;
-use crate::protocol::variant::VariantList;
+use crate::protocol::variant::{Variant, VariantList};
 use crate::world::{NpcAction, NpcType, TileFlags, TileType, World, WorldNpc, WorldObject, WorldTilePermission};
 use rusty_enet as enet;
 use std::collections::{HashMap, HashSet};
@@ -111,6 +111,10 @@ struct RedirectData {
     tank_id_name: String,
 }
 
+/// Wait before retrying after a connection attempt fails, like the official client
+/// ("Error connecting! ... Trying again in 30 seconds").
+const CONNECT_RETRY_MS: u64 = 30_000;
+
 pub struct Bot {
     host: BotHost,
     pub proxy: Option<Socks5Config>,
@@ -193,6 +197,13 @@ pub struct Bot {
     pub script_stop: Arc<AtomicBool>,
     /// When set, the bot will delay reconnecting until this instant (used for 2FA cooldown).
     reconnect_after: Option<std::time::Instant>,
+    /// Set by the Reconnect command so the resulting disconnect reconnects even when
+    /// `auto_reconnect` is off.
+    manual_reconnect: bool,
+    /// Key in the bot store; when set, every refreshed ltoken is written back to disk.
+    persist_key: Option<String>,
+    /// Last own talk-bubble text, to avoid logging the same rejection repeatedly.
+    last_bubble: String,
     /// Set when an `action|log` with "Advanced Account Protection" is received,
     /// so the subsequent `action|logon_fail` knows to apply the 120 s cooldown.
     pending_2fa: bool,
@@ -315,6 +326,9 @@ impl Bot {
             script_reply_tx: None,
             script_stop: Arc::new(AtomicBool::new(false)),
             reconnect_after: None,
+            manual_reconnect: false,
+            persist_key: None,
+            last_bubble: String::new(),
             pending_2fa: false,
             pending_relogon: false,
             pending_server_overload: false,
@@ -334,7 +348,7 @@ impl Bot {
             s.collect_radius_tiles = bot.collect_radius_tiles;
             s.collect_blacklist = sorted_blacklist_vec(&bot.collect_blacklist);
         }
-        bot.host.connect(creds.addr, 2, 0);
+        bot.connect_to(creds.addr);
         bot
     }
 
@@ -345,7 +359,8 @@ impl Bot {
         let rid = parts.next()?.to_string();
         let mac = parts.next()?.to_string();
         let wk = parts.next()?.to_string();
-        if rid.len() != 32 || wk.len() != 32 {
+        // "NONE0" is the wk the dashboard session uses (see `dashboard::DASHBOARD_WK`).
+        if rid.len() != 32 || !(wk.len() == 32 || wk == crate::dashboard::DASHBOARD_WK) {
             return None;
         }
         Some((token, rid, mac, wk))
@@ -359,6 +374,7 @@ impl Bot {
         items_dat: Arc<ItemsDat>,
         bot_id: u32,
         ws_tx: Option<WsTx>,
+        persist_key: Option<String>,
     ) -> Self {
         let (ltoken, rid, mac, wk) = Self::parse_ltoken_string(ltoken_str)
             .expect("[Bot] Invalid ltoken string — expected token|rid|mac|wk");
@@ -396,7 +412,7 @@ impl Bot {
         let mut alternate = false;
         let server_data = loop {
             log_fn(format!(
-                "[Bot] fetching server_data (alternate={alternate})..."
+                "[Status] Getting server address... (alternate={alternate})"
             ));
             match get_server_data_proxied(alternate, &login_info, proxy_url_ref) {
                 Ok(s) => break s,
@@ -479,6 +495,9 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
             script_reply_tx: None,
             script_stop: Arc::new(AtomicBool::new(false)),
             reconnect_after: None,
+            manual_reconnect: false,
+            persist_key: None,
+            last_bubble: String::new(),
             pending_2fa: false,
             pending_relogon: false,
             pending_server_overload: false,
@@ -497,12 +516,28 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
             s.collect_radius_tiles = bot.collect_radius_tiles;
             s.collect_blacklist = sorted_blacklist_vec(&bot.collect_blacklist);
         }
-        bot.host.connect(addr, 2, 0);
+        // The token was just refreshed by check_token; store the new one right away.
+        bot.persist_key = persist_key;
+        bot.persist_token();
+        bot.connect_to(addr);
         bot
     }
 
+    /// Writes the current `token|rid|mac|wk` to the bot store (no-op for unsaved bots).
+    fn persist_token(&self) {
+        if let Some(key) = &self.persist_key {
+            crate::bot_store::update_token(
+                key,
+                format!("{}|{}|{}|{}", self.ltoken, self.rid, self.mac, self.wk),
+            );
+        }
+    }
+
     fn reconnect_main(&mut self) {
+        // Any pending delayed reconnect is superseded by this one.
+        self.reconnect_after = None;
         self.host = Self::create_host(self.proxy.as_ref());
+        self.log_console("[Status] Getting server address...".to_string());
         self.refresh_token();
 
         let login_info = LoginInfo {
@@ -528,6 +563,12 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
         let addr: SocketAddr = format!("{}:{}", server_data.server, server_data.port)
             .parse()
             .expect("Invalid server address");
+        self.connect_to(addr);
+    }
+
+    /// Starts a connection attempt and logs it like the game client's status line.
+    fn connect_to(&mut self, addr: SocketAddr) {
+        self.log_console(format!("[Status] Located server, connecting to {addr}..."));
         self.host.connect(addr, 2, 0);
     }
 
@@ -650,12 +691,31 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
         let proxy_url = proxy.as_deref();
 
         if !self.ltoken.is_empty() {
-            if let Ok(new_token) = check_token(&self.ltoken, &login_data, proxy_url) {
-                self.log_console("[Bot] Token refreshed via check_token".to_string());
-                self.ltoken = new_token;
-                return;
+            // An ltoken bot has no credentials to fall back on, so one transient failure
+            // would stop it for good. Retry a few times before giving up.
+            let attempts = if matches!(self.login_method, LoginMethod::Ltoken) {
+                5
+            } else {
+                1
+            };
+            for attempt in 1..=attempts {
+                match check_token(&self.ltoken, &login_data, proxy_url) {
+                    Ok(new_token) => {
+                        self.log_console("[Bot] Token refreshed via check_token".to_string());
+                        self.ltoken = new_token;
+                        self.persist_token();
+                        return;
+                    }
+                    Err(e) => {
+                        self.log_console(format!(
+                            "[Bot] check_token failed (attempt {attempt}/{attempts}): {e}"
+                        ));
+                        if attempt < attempts {
+                            std::thread::sleep(std::time::Duration::from_secs(10));
+                        }
+                    }
+                }
             }
-            self.log_console("[Bot] check_token failed".to_string());
         }
 
         match &self.login_method {
@@ -713,7 +773,7 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                     self.reconnect_after = None;
                     if self.auto_reconnect {
                         self.log_console(
-                            "[Bot] 2FA cooldown elapsed — re-fetching token and server data"
+                            "[Bot] Reconnect delay elapsed — re-fetching token and server data"
                                 .to_string(),
                         );
                         self.reconnect_main();
@@ -765,7 +825,17 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                 }
 
                 enet::EventNoRef::Disconnect { peer: id, .. } => {
+                    let manual_reconnect = std::mem::take(&mut self.manual_reconnect);
+                    let was_connected = self.peer_id.is_some();
                     self.peer_id = None;
+                    if !was_connected {
+                        // A disconnect without a prior connect means the connection attempt
+                        // itself failed (the real client shows this as "Error connecting!").
+                        self.log_console(
+                            "[Status] Error connecting! Timed out. The server might be down or rebooting."
+                                .to_string(),
+                        );
+                    }
                     self.pathfind_target = None;
                     self.pathfind_recalc = false;
                     self.log_console(format!("[Bot] Disconnected: peer {}", id.0));
@@ -784,15 +854,42 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                         bot_id: self.bot_id,
                         world_name: String::new(),
                     });
-                    if let Some(r) = self.redirect.as_ref() {
+                    if !was_connected && self.reconnect_after.is_none() {
+                        // The connection attempt itself failed: wait before trying again
+                        // instead of hammering the server (non-blocking, see `reconnect_after`).
+                        if self.auto_reconnect {
+                            // The failed attempt may have targeted a one-shot redirect;
+                            // start over from the main server with a fresh token.
+                            self.redirect = None;
+                            let delay_ms = CONNECT_RETRY_MS.max(self.reconnect_interval);
+                            self.log_console(format!(
+                                "[Status] Trying again in {} seconds.",
+                                delay_ms / 1000
+                            ));
+                            self.reconnect_after = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(delay_ms),
+                            );
+                        } else {
+                            self.log_console(
+                                "[Bot] Connection failed — auto-reconnect is disabled".to_string(),
+                            );
+                        }
+                    } else if let Some(r) = self.redirect.as_ref() {
                         let addr: SocketAddr = format!("{}:{}", r.server, r.port)
                             .parse()
                             .expect("Invalid redirect address");
                         self.log_console(format!("[Bot] Redirecting to {}:{}", r.server, r.port));
                         self.host = Self::create_host(self.proxy.as_ref());
-                        self.host.connect(addr, 2, 0);
+                        self.connect_to(addr);
                     } else if self.reconnect_after.is_some() {
                         // Delayed reconnect already scheduled (e.g. 2FA cooldown) — do nothing here.
+                    } else if manual_reconnect {
+                        self.log_console(
+                            "[Bot] Manual reconnect — re-fetching token and server data"
+                                .to_string(),
+                        );
+                        self.reconnect_main();
                     } else if self.auto_reconnect {
                         if self.reconnect_interval > 0 {
                             self.log_console(format!(
@@ -1507,6 +1604,38 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
             "OnConsoleMessage" => {
                 let message = vl.get(1).map(|v| v.as_string()).unwrap_or_default();
                 self.log_console(message);
+            }
+            // Player-facing notices the game client shows on screen instead of in chat.
+            "OnTextOverlay" => {
+                let text = vl.get(1).map(|v| v.as_string()).unwrap_or_default();
+                self.log_console(format!("[Notice] {text}"));
+            }
+            "OnAddNotification" => {
+                let text = (1..)
+                    .map_while(|i| vl.get(i))
+                    .filter_map(|v| match v {
+                        Variant::String(s) if !s.ends_with(".rttex") && !s.ends_with(".wav") => {
+                            Some(s.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                self.log_console(format!("[Notification] {text}"));
+            }
+            "OnTalkBubble" => {
+                // Other players' bubbles duplicate chat already shown in the console,
+                // so only show the bot's own (server feedback such as failed actions).
+                // The net id can arrive as a signed or unsigned variant, so compare as text.
+                let net_id = vl.get(1).map(|v| v.as_string()).unwrap_or_default();
+                if net_id.trim().parse::<i64>().ok() == Some(self.local.net_id as i64) {
+                    let text = vl.get(2).map(|v| v.as_string()).unwrap_or_default();
+                    // A failing loop repeats the same rejection; show it once per change.
+                    if text != self.last_bubble {
+                        self.log_console(format!("[Bubble] {text}"));
+                        self.last_bubble = text;
+                    }
+                }
             }
             "OnDialogRequest" => {
                 let message = vl.get(1).map(|v| v.as_string()).unwrap_or_default();
@@ -2678,9 +2807,31 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                 let stop_flag = self.script_stop.clone();
                 let username = self.username.clone();
 
+                // Script output (print, start/stop, errors) goes to the live web console.
+                let console_state = self.state.clone();
+                let console_ws = self.ws_tx.clone();
+                let console_bot_id = self.bot_id;
+                let console: crate::lua::ConsoleFn = Arc::new(move |msg: String| {
+                    println!("{msg}");
+                    {
+                        let mut s = console_state.write().unwrap();
+                        s.console.push(msg.clone());
+                        if s.console.len() > 100 {
+                            s.console.remove(0);
+                        }
+                    }
+                    if let Some(tx) = &console_ws {
+                        let _ = tx.send(WsEvent::Console {
+                            bot_id: console_bot_id,
+                            message: msg,
+                        });
+                    }
+                });
+
                 std::thread::spawn(move || {
                     crate::lua::run_script_threaded(
                         req_tx, reply_rx, event_rx, items, state, stop_flag, username, content,
+                        console,
                     );
                 });
             }
@@ -2698,6 +2849,7 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
             }
             BotCommand::Reconnect => {
                 if self.peer_id.is_some() {
+                    self.manual_reconnect = true;
                     self.disconnect();
                 } else {
                     self.reconnect_main();

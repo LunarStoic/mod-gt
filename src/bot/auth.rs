@@ -29,7 +29,7 @@ pub(super) fn fetch_credentials(
     let mut alternate = false;
     loop {
         log(format!(
-            "[Bot] fetching server_data (alternate={alternate})..."
+            "[Status] Getting server address... (alternate={alternate})"
         ));
         let server_data = match get_server_data_proxied(alternate, &login_info, proxy_url) {
             Ok(s) => s,

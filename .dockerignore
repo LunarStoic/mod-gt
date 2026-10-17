@@ -1,0 +1,9 @@
+.git
+/target
+/growtopia
+/GrowtopiaInstaller.exe
+/capture
+/docs
+/frida
+**/node_modules
+web/dist

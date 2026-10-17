@@ -947,9 +947,13 @@ pub fn run_script_threaded(
     stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     username:  String,
     script:    String,
+    console:   ConsoleFn,
 ) {
-    run_script_inner(req_tx, reply_rx, event_rx, items, state, stop_flag, username, script);
+    run_script_inner(req_tx, reply_rx, event_rx, items, state, stop_flag, username, script, console);
 }
+
+/// Appends a line to the bot console (shown live in the web UI).
+pub type ConsoleFn = Arc<dyn Fn(String) + Send + Sync>;
 
 fn run_script_inner(
     req_tx:    crossbeam_channel::Sender<crate::script_channel::ScriptRequest>,
@@ -960,6 +964,7 @@ fn run_script_inner(
     stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     username:  String,
     script:    String,
+    console:   ConsoleFn,
 ) {
     let lua = Lua::new_with(
         mlua::StdLib::TABLE | mlua::StdLib::STRING | mlua::StdLib::MATH | mlua::StdLib::IO,
@@ -1067,6 +1072,20 @@ fn run_script_inner(
             }
             Ok(out)
         })?)?;
+
+        // ── print(...) → bot console ──────────────────────────────────────────
+        {
+            let console2 = console.clone();
+            lua.globals().set("print", lua.create_function(move |_, args: mlua::Variadic<LuaValue>| {
+                let line = args
+                    .iter()
+                    .map(|v| v.to_string().unwrap_or_else(|_| "?".to_string()))
+                    .collect::<Vec<_>>()
+                    .join("\t");
+                console2(format!("[Script] {line}"));
+                Ok(())
+            })?)?;
+        }
 
         // ── clearConsole() ────────────────────────────────────────────────────
         {
@@ -1246,8 +1265,9 @@ do
             if name and pack_id then
                 local parsed_items = {}
                 if items and items ~= "" then
-                    for token in items:gmatch("[^,]+") do
-                        token = token:match("^%s*(.-)%s*$")
+                    for raw in items:gmatch("[^,]+") do
+                        -- Lua 5.5: loop variables are read-only, so trim into a new local.
+                        local token = raw:match("^%s*(.-)%s*$")
                         parsed_items[#parsed_items + 1] = tonumber(token) or token
                     end
                 end
@@ -1415,14 +1435,17 @@ end
     };
 
     if let Err(e) = setup() {
-        state.write().unwrap().console.push(format!("`4[Lua setup error] {e}"));
+        console(format!("`4[Lua setup error] {e}"));
         return;
     }
 
-    if let Err(e) = lua.load(&script).exec() {
-        if !e.to_string().contains("__script_stop__") {
-            state.write().unwrap().console.push(format!("`4[Lua] {e}"));
+    console("[Script] started".to_string());
+    match lua.load(&script).exec() {
+        Ok(()) => console("[Script] finished".to_string()),
+        Err(e) if e.to_string().contains("__script_stop__") => {
+            console("[Script] stopped".to_string());
         }
+        Err(e) => console(format!("`4[Lua] {e}")),
     }
 }
 

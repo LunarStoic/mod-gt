@@ -8,11 +8,17 @@ use serde_json;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 
+/// Device identity sent with the dashboard request. A login link is tied to
+/// this session, so a token obtained through it must be paired with the same values.
+pub const DASHBOARD_MAC: &str = "02:00:00:00:00:00";
+pub const DASHBOARD_WK: &str = "NONE0";
+
 #[derive(Debug)]
 pub struct DashboardLinks {
     pub apple: Option<String>,
     pub google: Option<String>,
     pub growtopia: Option<String>,
+    pub rid: String,
 }
 
 pub fn get_dashboard(login_url: &str, login_info: &LoginInfo, meta: &str) -> Result<DashboardLinks> {
@@ -55,8 +61,8 @@ pub fn get_dashboard_proxied(
         ("deviceVersion", "0"),
         ("country",       "us"),
         ("hash",          &hash.to_string()),
-        ("mac",           "02:00:00:00:00:00"),
-        ("wk",            "NONE0"),
+        ("mac",           DASHBOARD_MAC),
+        ("wk",            DASHBOARD_WK),
     ]);
 
     let agent = if let Some(p) = proxy_url {
@@ -112,6 +118,7 @@ pub fn get_dashboard_proxied(
         apple: apple_href,
         google: google_href,
         growtopia: growtopia_href,
+        rid,
     })
 }
 

@@ -5,6 +5,7 @@ import {
   Wifi,
   PlugZap,
   Unplug,
+  RefreshCw,
   ChevronUp,
   ChevronDown,
   ChevronLeft,
@@ -34,7 +35,7 @@ import {
 import { parseGTColors } from "@/lib/gt-colors";
 import { Minimap } from "@/components/minimap";
 import { cn } from "@/lib/utils";
-import type { BotStatus } from "@/lib/api";
+import type { BotStatus, WorldObject } from "@/lib/api";
 
 const STATUS_DOT: Record<BotStatus, string> = {
   connecting: "bg-yellow-500",
@@ -92,6 +93,20 @@ export function BotDetail({ bot }: { bot: LiveBot }) {
       .catch(() => {});
   }, [bot.id, setBots]);
 
+  function toggleAutoReconnect() {
+    const enabled = !bot.auto_reconnect;
+    const apply = (value: boolean) =>
+      setBots((m) => {
+        const existing = m.get(bot.id);
+        if (!existing) return m;
+        return new Map(m).set(bot.id, { ...existing, auto_reconnect: value });
+      });
+    apply(enabled);
+    api
+      .sendCmd(bot.id, { type: "set_auto_reconnect", enabled })
+      .catch(() => apply(!enabled));
+  }
+
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header bar */}
@@ -128,6 +143,22 @@ export function BotDetail({ bot }: { bot: LiveBot }) {
           </span>
         )}
         <button
+          title={
+            bot.auto_reconnect
+              ? "Auto-reconnect: ON (click to turn off)"
+              : "Auto-reconnect: OFF (click to turn on)"
+          }
+          onClick={toggleAutoReconnect}
+          className={cn(
+            "w-5 h-5 flex items-center justify-center rounded hover:bg-muted transition-colors",
+            bot.auto_reconnect
+              ? "text-emerald-500"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          <RefreshCw className="w-3 h-3" />
+        </button>
+        <button
           title="Reconnect"
           onClick={() => api.sendCmd(bot.id, { type: "reconnect" })}
           className="w-5 h-5 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
@@ -135,9 +166,14 @@ export function BotDetail({ bot }: { bot: LiveBot }) {
           <PlugZap className="w-3 h-3" />
         </button>
         <button
-          title="Disconnect"
+          title={
+            bot.auto_reconnect
+              ? "Disconnect is disabled while auto-reconnect is on"
+              : "Disconnect"
+          }
+          disabled={bot.auto_reconnect}
           onClick={() => api.sendCmd(bot.id, { type: "disconnect" })}
-          className="w-5 h-5 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+          className="w-5 h-5 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted-foreground"
         >
           <Unplug className="w-3 h-3" />
         </button>
@@ -326,20 +362,80 @@ function OverviewTab({ bot }: { bot: LiveBot }) {
           />
         </Section>
 
-        <Section label="Floating Objects">
-          <DataTable
-            columns={["Item", "Amt", "Pos", "UID"]}
-            rows={bot.objects.map((o) => [
-              itemLabel(o.item_id),
-              String(o.count),
-              `${o.x.toFixed(1)},${o.y.toFixed(1)}`,
-              String(o.uid),
-            ])}
-            empty="No objects"
-          />
-        </Section>
+        <FloatingObjects objects={bot.objects} itemLabel={itemLabel} />
       </div>
     </div>
+  );
+}
+
+// ── Overview: floating objects (per object / total per item) ────────────────
+
+function FloatingObjects({
+  objects,
+  itemLabel,
+}: {
+  objects: WorldObject[];
+  itemLabel: (id: number) => string;
+}) {
+  const [mode, setMode] = useState<"total" | "each">("total");
+
+  const totals = new Map<number, { amount: number; stacks: number }>();
+  let grandTotal = 0;
+  for (const o of objects) {
+    const entry = totals.get(o.item_id) ?? { amount: 0, stacks: 0 };
+    entry.amount += o.count;
+    entry.stacks += 1;
+    totals.set(o.item_id, entry);
+    grandTotal += o.count;
+  }
+  const totalRows = [...totals.entries()]
+    .sort((a, b) => b[1].amount - a[1].amount)
+    .map(([id, t]) => [itemLabel(id), t.amount.toLocaleString(), String(t.stacks)]);
+
+  return (
+    <Section
+      label="Floating Objects"
+      hint={
+        objects.length > 0
+          ? `${totals.size} items · ${grandTotal.toLocaleString()} total`
+          : undefined
+      }
+    >
+      <div className="mb-1.5 flex gap-1">
+        {(["total", "each"] as const).map((m) => (
+          <button
+            key={m}
+            onClick={() => setMode(m)}
+            className={cn(
+              "rounded border border-border px-2 py-0.5 text-[10px] transition-colors",
+              mode === m
+                ? "bg-accent text-accent-foreground"
+                : "text-muted-foreground hover:bg-muted",
+            )}
+          >
+            {m === "total" ? "Total per item" : "Per object"}
+          </button>
+        ))}
+      </div>
+      {mode === "total" ? (
+        <DataTable
+          columns={["Item", "Total", "Stacks"]}
+          rows={totalRows}
+          empty="No objects"
+        />
+      ) : (
+        <DataTable
+          columns={["Item", "Amt", "Pos", "UID"]}
+          rows={objects.map((o) => [
+            itemLabel(o.item_id),
+            String(o.count),
+            `${o.x.toFixed(1)},${o.y.toFixed(1)}`,
+            String(o.uid),
+          ])}
+          empty="No objects"
+        />
+      )}
+    </Section>
   );
 }
 

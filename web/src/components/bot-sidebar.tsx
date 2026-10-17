@@ -2,7 +2,13 @@ import { useState } from 'react'
 import { Plus, Trash2, ChevronDown, ChevronRight, Loader2, X } from 'lucide-react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
 import { botsAtom, selectedBotIdAtom } from '@/lib/store'
-import { api, type BotStatus, type SpawnBotBody, type SpawnLtokenBody } from '@/lib/api'
+import {
+  api,
+  type BotStatus,
+  type SpawnBotBody,
+  type SpawnGoogleBody,
+  type SpawnLtokenBody,
+} from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -78,9 +84,24 @@ function AddBotForm({ onDone }: { onDone: () => void }) {
   const [proxyStr, setProxyStr] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [method, setMethod] = useState<'legacy' | 'ltoken'>('legacy')
+  const [method, setMethod] = useState<'legacy' | 'ltoken' | 'google'>('legacy')
+  const [googleLink, setGoogleLink] = useState<{ link: string; rid: string } | null>(null)
+  const [googleToken, setGoogleToken] = useState('')
+  const [linkLoading, setLinkLoading] = useState(false)
 
-  function buildProxy(body: SpawnBotBody | SpawnLtokenBody) {
+  async function handleGetGoogleLink() {
+    setError('')
+    setLinkLoading(true)
+    try {
+      setGoogleLink(await api.googleLink())
+    } catch {
+      setError('Failed to get Google link')
+    } finally {
+      setLinkLoading(false)
+    }
+  }
+
+  function buildProxy(body: SpawnBotBody | SpawnLtokenBody | SpawnGoogleBody) {
     if (showProxy && proxyStr) {
       const parts = proxyStr.split(':')
       if (parts.length >= 2) {
@@ -102,6 +123,16 @@ function AddBotForm({ onDone }: { onDone: () => void }) {
         const body: SpawnBotBody = { username, password }
         buildProxy(body)
         await api.spawnBot(body)
+      } else if (method === 'google') {
+        if (!googleLink) {
+          setError('Get a Google link first')
+          return
+        }
+        const body: SpawnGoogleBody = { token: googleToken, rid: googleLink.rid }
+        buildProxy(body)
+        await api.spawnGoogleBot(body)
+        setGoogleLink(null)
+        setGoogleToken('')
       } else {
         const body: SpawnLtokenBody = { ltoken: ltokenStr }
         buildProxy(body)
@@ -117,10 +148,11 @@ function AddBotForm({ onDone }: { onDone: () => void }) {
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-1.5">
-      <Tabs value={method} onValueChange={(v) => setMethod(v as 'legacy' | 'ltoken')}>
+      <Tabs value={method} onValueChange={(v) => setMethod(v as 'legacy' | 'ltoken' | 'google')}>
         <TabsList className="w-full h-7">
           <TabsTrigger value="legacy" className="flex-1 text-[10px]">Legacy</TabsTrigger>
           <TabsTrigger value="ltoken" className="flex-1 text-[10px]">Ltoken</TabsTrigger>
+          <TabsTrigger value="google" className="flex-1 text-[10px]">Google</TabsTrigger>
         </TabsList>
 
         <TabsContent value="legacy" className="flex flex-col gap-1.5 mt-1.5">
@@ -148,6 +180,37 @@ function AddBotForm({ onDone }: { onDone: () => void }) {
             onChange={(e) => setLtokenStr(e.target.value)}
             className="h-7 text-xs font-mono"
             required={method === 'ltoken'}
+          />
+        </TabsContent>
+
+        <TabsContent value="google" className="flex flex-col gap-1.5 mt-1.5">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="w-full text-xs"
+            onClick={handleGetGoogleLink}
+            disabled={linkLoading}
+          >
+            {linkLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : '1. Get Google link'}
+          </Button>
+          {googleLink && (
+            <a
+              href={googleLink.link}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="text-[10px] text-primary underline"
+            >
+              2. Open link and sign in with Google
+            </a>
+          )}
+          <Input
+            placeholder="3. Paste token or JSON result"
+            value={googleToken}
+            onChange={(e) => setGoogleToken(e.target.value)}
+            className="h-7 text-xs font-mono"
+            disabled={!googleLink}
+            required={method === 'google'}
           />
         </TabsContent>
       </Tabs>

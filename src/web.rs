@@ -19,6 +19,9 @@ use crate::auth::AuthState;
 use crate::bot::Socks5Config;
 use crate::bot_manager::{BotInfo, BotManager};
 use crate::bot_state::{BotCommand, BotDelays, BotState};
+use crate::constants::{GAME_VER, PROTOCOL};
+use crate::dashboard::{DASHBOARD_MAC, DASHBOARD_WK, get_dashboard_proxied};
+use crate::server_data::{LoginInfo, get_server_data_proxied};
 use crate::events::WsTx;
 use crate::items::ItemInfo;
 use crate::proxy_test::{ProxyTestResult, run_proxy_test};
@@ -203,6 +206,99 @@ async fn spawn_ltoken_bot(
     };
     let id = s.manager.lock().unwrap().spawn_ltoken(req.ltoken, proxy);
     Json(serde_json::json!({ "id": id }))
+}
+
+// ── Google login ──────────────────────────────────────────────────────────────
+
+/// Requests a fresh dashboard session and returns its Google login link plus the
+/// session id (`rid`). The user signs in with Google in their own browser and
+/// then submits the resulting token together with this `rid`.
+async fn google_link() -> Result<Json<serde_json::Value>, StatusCode> {
+    let result = tokio::task::spawn_blocking(|| {
+        let login_info = LoginInfo {
+            protocol: PROTOCOL,
+            game_version: GAME_VER.into(),
+        };
+        // The server sometimes answers "Please try login again." on the first try
+        // (the bot login loop retries the same way), so retry a few times.
+        let mut last_err = String::new();
+        for attempt in 0..4 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+            let sd = match get_server_data_proxied(false, &login_info, None)
+                .or_else(|_| get_server_data_proxied(true, &login_info, None))
+            {
+                Ok(sd) => sd,
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue;
+                }
+            };
+            match get_dashboard_proxied(&sd.loginurl, &login_info, &sd.meta, None) {
+                Ok(links) => return Ok(links),
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        Err(last_err)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match result {
+        Ok(links) => match links.google {
+            Some(link) => Ok(Json(serde_json::json!({ "link": link, "rid": links.rid }))),
+            None => Err(StatusCode::BAD_GATEWAY),
+        },
+        Err(e) => {
+            println!("[Google] dashboard request failed: {e}");
+            Err(StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SpawnGoogleRequest {
+    /// Either the bare token or the whole JSON the login page displayed.
+    token:          String,
+    rid:            String,
+    proxy_host:     Option<String>,
+    proxy_port:     Option<u16>,
+    proxy_username: Option<String>,
+    proxy_password: Option<String>,
+}
+
+async fn spawn_google_bot(
+    State(s): State<AppState>,
+    Json(req): Json<SpawnGoogleRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let raw = req.token.trim();
+    let token = if raw.starts_with('{') {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v["token"].as_str().map(str::to_owned))
+            .ok_or(StatusCode::BAD_REQUEST)?
+    } else {
+        raw.to_owned()
+    };
+    // `|` separates the ltoken fields, so none of them may contain it.
+    if token.is_empty() || token.contains('|') || req.rid.len() != 32 || req.rid.contains('|') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let proxy = match (req.proxy_host, req.proxy_port) {
+        (Some(host), Some(port)) => format!("{}:{}", host, port).parse().ok().map(|proxy_addr| {
+            Socks5Config {
+                proxy_addr,
+                username: req.proxy_username,
+                password: req.proxy_password,
+            }
+        }),
+        _ => None,
+    };
+    let ltoken = format!("{token}|{}|{DASHBOARD_MAC}|{DASHBOARD_WK}", req.rid);
+    let id = s.manager.lock().unwrap().spawn_ltoken(ltoken, proxy);
+    Ok(Json(serde_json::json!({ "id": id })))
 }
 
 async fn stop_bot(
@@ -496,6 +592,8 @@ pub async fn serve(manager: SharedManager, ws_tx: WsTx) {
         // Protected API
         .route("/bots", get(list_bots).post(spawn_bot))
         .route("/bots/ltoken", post(spawn_ltoken_bot))
+        .route("/bots/google/link", post(google_link))
+        .route("/bots/google", post(spawn_google_bot))
         .route("/bots/{id}", delete(stop_bot))
         .route("/bots/{id}/state", get(bot_state))
         .route("/bots/{id}/cmd", post(bot_cmd))

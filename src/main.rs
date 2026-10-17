@@ -7,6 +7,7 @@ mod inventory;
 pub mod events;
 mod bot_state;
 mod bot_manager;
+mod bot_store;
 mod dashboard;
 pub mod items;
 mod login;
@@ -28,5 +29,6 @@ use bot_manager::BotManager;
 async fn main() {
     let (ws_tx, _) = tokio::sync::broadcast::channel(256);
     let mgr = Arc::new(Mutex::new(BotManager::new(ws_tx.clone())));
+    mgr.lock().unwrap().restore_saved();
     web::serve(mgr, ws_tx).await;
 }

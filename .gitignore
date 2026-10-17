@@ -1,3 +1,8 @@
 /target
 dist
 user.json
+
+# Game client, installer, and network captures (large / sensitive, local only)
+/growtopia/
+/GrowtopiaInstaller.exe
+/capture/
