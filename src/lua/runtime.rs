@@ -526,6 +526,23 @@ impl LuaUserData for LuaWorld {
             Ok(w.world.get_tile(x, y).cloned().map(LuaTile))
         });
 
+        // Documented in LUA.md but missing until now: can the bot build/break on this tile?
+        methods.add_method("hasAccess", |_, w, (x, y): (u32, u32)| {
+            let map = &w.world.tile_map;
+            if x >= map.width || y >= map.height {
+                return Ok(false);
+            }
+            let perm = map.get_tile_permission(x, y, w.local_user_id);
+            let idx = (y * map.width + x) as usize;
+            let inside_area_lock = map
+                .tiles
+                .get(idx)
+                .map(|t| t.flags.contains(TileFlags::HAS_PARENT))
+                .unwrap_or(false);
+            // A world without a world lock is open to everyone (unless inside an area lock).
+            Ok(!perm.is_empty() || (map.world_lock_index.is_none() && !inside_area_lock))
+        });
+
         methods.add_method("getTiles", |lua, w, ()| {
             create_lazy_tile_sequence(lua, Arc::clone(&w.world))
         });

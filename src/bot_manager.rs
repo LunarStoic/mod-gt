@@ -84,6 +84,7 @@ impl BotManager {
             key: key.clone(),
             ltoken: ltoken_str.clone(),
             proxy: proxy.as_ref().map(SavedProxy::from_config),
+            settings: None,
         });
         self.spawn_ltoken_with_key(ltoken_str, proxy, key)
     }

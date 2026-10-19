@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::bot::Socks5Config;
+use crate::bot_state::BotDelays;
 
 /// Serializes read-modify-write cycles; bots refresh their token from separate threads.
 static LOCK: Mutex<()> = Mutex::new(());
@@ -22,13 +23,26 @@ pub struct SavedProxy {
     pub password: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Settings changed from the dashboard (auto-collect, do-not-collect list, delays, ...).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedSettings {
+    pub auto_collect: bool,
+    pub auto_reconnect: bool,
+    pub collect_radius_tiles: u8,
+    pub collect_blacklist: Vec<u16>,
+    pub delays: BotDelays,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SavedBot {
     /// Stable id, independent of the per-run numeric bot id.
     pub key: String,
     /// Latest `token|rid|mac|wk`.
     pub ltoken: String,
     pub proxy: Option<SavedProxy>,
+    /// Absent in files written by older versions.
+    #[serde(default)]
+    pub settings: Option<SavedSettings>,
 }
 
 impl SavedProxy {
@@ -112,6 +126,21 @@ pub fn update_token(key: &str, ltoken: String) {
         bot.ltoken = ltoken;
         write_all(&bots);
     }
+}
+
+/// Stores the dashboard settings of an existing bot (no-op if the bot was removed).
+pub fn update_settings(key: &str, settings: SavedSettings) {
+    let _guard = locked();
+    let mut bots = read_all();
+    if let Some(bot) = bots.iter_mut().find(|b| b.key == key) {
+        bot.settings = Some(settings);
+        write_all(&bots);
+    }
+}
+
+pub fn load_settings(key: &str) -> Option<SavedSettings> {
+    let _guard = locked();
+    read_all().into_iter().find(|b| b.key == key)?.settings
 }
 
 pub fn remove(key: &str) {

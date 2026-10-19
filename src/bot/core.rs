@@ -517,10 +517,46 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
             s.collect_blacklist = sorted_blacklist_vec(&bot.collect_blacklist);
         }
         // The token was just refreshed by check_token; store the new one right away.
-        bot.persist_key = persist_key;
+        bot.persist_key = persist_key.clone();
+        if let Some(key) = &persist_key {
+            if let Some(saved) = crate::bot_store::load_settings(key) {
+                bot.apply_saved_settings(&saved);
+            }
+        }
         bot.persist_token();
         bot.connect_to(addr);
         bot
+    }
+
+    /// Remembers the dashboard settings so they survive a restart (no-op for unsaved bots).
+    fn persist_settings(&self) {
+        if let Some(key) = &self.persist_key {
+            crate::bot_store::update_settings(
+                key,
+                crate::bot_store::SavedSettings {
+                    auto_collect: self.auto_collect,
+                    auto_reconnect: self.auto_reconnect,
+                    collect_radius_tiles: self.collect_radius_tiles,
+                    collect_blacklist: sorted_blacklist_vec(&self.collect_blacklist),
+                    delays: self.delays.clone(),
+                },
+            );
+        }
+    }
+
+    /// Applies settings saved by a previous run and mirrors them into the shared state.
+    fn apply_saved_settings(&mut self, saved: &crate::bot_store::SavedSettings) {
+        self.auto_collect = saved.auto_collect;
+        self.auto_reconnect = saved.auto_reconnect;
+        self.collect_radius_tiles = saved.collect_radius_tiles.clamp(1, 5);
+        self.collect_blacklist = saved.collect_blacklist.iter().copied().collect();
+        self.delays = saved.delays.clone();
+        let mut st = self.state.write().unwrap();
+        st.auto_collect = self.auto_collect;
+        st.auto_reconnect = self.auto_reconnect;
+        st.collect_radius_tiles = self.collect_radius_tiles;
+        st.collect_blacklist = sorted_blacklist_vec(&self.collect_blacklist);
+        st.delays = self.delays.clone();
     }
 
     /// Writes the current `token|rid|mac|wk` to the bot store (no-op for unsaved bots).
@@ -1212,42 +1248,53 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                             self.log_console(format!("[Bot] Track: {s}"));
                             let fields: std::collections::HashMap<&str, &str> =
                                 s.lines().filter_map(|line| line.split_once('|')).collect();
-                            let level = fields
-                                .get("Level")
-                                .and_then(|v| v.parse::<u32>().ok())
-                                .unwrap_or(0);
-                            let grow_id = fields
-                                .get("GrowId")
-                                .and_then(|v| v.parse::<u64>().ok())
-                                .unwrap_or(0);
-                            let install_date = fields
-                                .get("installDate")
-                                .and_then(|v| v.parse::<u64>().ok())
-                                .unwrap_or(0);
-                            let global_playtime = fields
-                                .get("Global_Playtime")
-                                .and_then(|v| v.parse::<u64>().ok())
-                                .unwrap_or(0);
-                            let awesomeness = fields
-                                .get("Awesomeness")
-                                .and_then(|v| v.parse::<u32>().ok())
-                                .unwrap_or(0);
-                            self.state.write().unwrap().track_info =
-                                Some(crate::bot_state::TrackInfo {
+                            // Different Track packets carry different fields (the authentication
+                            // packet has no Level, for example). Update only what this packet
+                            // contains instead of overwriting everything with zeros.
+                            const ACCOUNT_KEYS: [&str; 6] = [
+                                "Level",
+                                "GrowId",
+                                "installDate",
+                                "Global_Playtime",
+                                "Awesomeness",
+                                "Grow_Id",
+                            ];
+                            if ACCOUNT_KEYS.iter().any(|k| fields.contains_key(*k)) {
+                                let num = |keys: &[&str]| -> Option<u64> {
+                                    keys.iter()
+                                        .find_map(|k| fields.get(k).and_then(|v| v.parse::<u64>().ok()))
+                                };
+                                let prev = self
+                                    .state
+                                    .read()
+                                    .unwrap()
+                                    .track_info
+                                    .clone()
+                                    .unwrap_or_default();
+                                let level = num(&["Level"]).map_or(prev.level, |v| v as u32);
+                                let grow_id = num(&["GrowId", "Grow_Id"]).unwrap_or(prev.grow_id);
+                                let install_date = num(&["installDate"]).unwrap_or(prev.install_date);
+                                let global_playtime =
+                                    num(&["Global_Playtime"]).unwrap_or(prev.global_playtime);
+                                let awesomeness =
+                                    num(&["Awesomeness"]).map_or(prev.awesomeness, |v| v as u32);
+                                self.state.write().unwrap().track_info =
+                                    Some(crate::bot_state::TrackInfo {
+                                        level,
+                                        grow_id,
+                                        install_date,
+                                        global_playtime,
+                                        awesomeness,
+                                    });
+                                self.emit(WsEvent::BotTrackInfo {
+                                    bot_id: self.bot_id,
                                     level,
                                     grow_id,
                                     install_date,
                                     global_playtime,
                                     awesomeness,
                                 });
-                            self.emit(WsEvent::BotTrackInfo {
-                                bot_id: self.bot_id,
-                                level,
-                                grow_id,
-                                install_date,
-                                global_playtime,
-                                awesomeness,
-                            });
+                            }
                         }
                         Some(IncomingPacket::ClientLogRequest) => {
                             self.log_console("[Bot] ClientLogRequest".to_string());
@@ -2772,6 +2819,14 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
     }
 
     fn handle_command(&mut self, cmd: BotCommand) {
+        // Settings the dashboard can change are saved with the bot.
+        let settings_changed = matches!(
+            cmd,
+            BotCommand::SetDelays(_)
+                | BotCommand::SetAutoCollect { .. }
+                | BotCommand::SetAutoReconnect { .. }
+                | BotCommand::SetCollectConfig { .. }
+        );
         match cmd {
             BotCommand::Move { x, y } => {
                 let cx = ((self.pos_x / 32.0).round() as i32) + x;
@@ -2918,6 +2973,9 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                 st.collect_blacklist = sorted_blacklist_vec(&self.collect_blacklist);
             }
             BotCommand::AcceptAccess => self.accept_access(),
+        }
+        if settings_changed {
+            self.persist_settings();
         }
     }
 
