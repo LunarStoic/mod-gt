@@ -239,6 +239,8 @@ Catatan: hanya konteks percakapan yang benar-benar tersedia di sesi ini. Tidak a
 
 58. **Skrip berlapis: place Dirt harus pasti kena (2026-10-19, permintaan pengguna).** Alasan: melewati tile bolong lalu kembali memeriksa dan berjalan lagi lebih lama. Perubahan di chat: helper `placeFirm(tx, py, standX, gy)` memasang Dirt di satu tile, menunggu konfirmasi server (maks ±1,2 dtk), mengulang sampai tile terisi (tiap 4 percobaan berjalan ulang ke posisi berdiri, jeda naik, log tiap 5 percobaan); hanya berhenti bila Dirt habis. `buildSome` memakainya per tile sehingga tidak ada tile bolong yang terlewat. **Belum diuji.**
 
+59. **Skrip disimpan sebagai file `.txt` (2026-10-19, permintaan pengguna).** Folder baru `scripts/` di root repo: `scripts/pnb.txt` (PnB satu `ITEM_ID`, versi `findPath` dengan `MAX_PUNCH=30`/`MAX_FAILS=5`) dan `scripts/build_dirt_farm.txt` (builder world berlapis + tanam Dirt Seed sambil membangun + `placeFirm`, versi terakhir). Satu skrip per file; skrip baru berikutnya ikut pola ini. Isi diambil dari jawaban terakhir di chat; **belum diuji di bot online**. Belum di-commit (folder untracked).
+
 ## 12. Last Updated
 
 2026-10-17, Sesi 1 lanjutan: perbaikan info akun (Track merge) dan persistensi pengaturan dashboard di-deploy; menunggu uji pengguna. Perubahan kode belum di-commit.

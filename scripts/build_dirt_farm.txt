@@ -1,0 +1,1196 @@
+-- New (default) world -> alternating platform rows and 1-tile gap rows over the WHOLE world (as in the screenshot).
+-- START: the script first checks whether the bot is inside TARGET_WORLD. If not, it enters it (the bot appears at the
+--   white door). If it is already inside, it starts right from where it stands.
+-- WORK ORDER: the world is scanned and the NEAREST work is done first: the nearest row that still has work, and
+--   inside that row the nearest tile. Work = blocks or background left in a gap row, platform ends (x = 0 and 99)
+--   that are not open, lava in the platform rows (broken, drop taken, hole filled with Dirt), and item drops that
+--   were not picked up yet. Rows are reached through the edge columns (a shaft is dug where there is none yet).
+--   Platform rows (y = TOP_Y, TOP_Y+2, ...) stay, open at BOTH ends; the gap rows between them end up empty.
+-- ORDER OF PHASES:
+--   1. clean the dirt layer (nearest first)       2. CHECK the dirt layer and repair until clean
+--   3. BUILD the top (platform rows upward)       4. CHECK THE WHOLE WORLD at once and repair what is left
+-- BUILDING THE TOP: first the script counts the Dirt the top still needs. If the backpack + the depot beside the
+--   main door hold less than that, it PLANTS Dirt Seeds on the surface row and keeps BUILDING with the Dirt it has
+--   while the trees grow (GROW_S seconds). As soon as the trees are ready it HARVESTS them, picks up everything,
+--   builds on, and plants again if Dirt is still short, and so on.
+--   Every Dirt is placed until it really sticks: a tile is never skipped, so no hole is left behind.
+-- BACKPACK: when it is full (slots, or Dirt / Dirt Seed at the 200 cap) the bot walks to the main door and drops
+--   the surplus beside it (everything except fist, wrench, pickaxe, gems; of Dirt / Dirt Seed only the part above a
+--   small reserve), then comes back to where it was.
+-- CONNECTION PROBLEMS NEVER STOP THE SCRIPT: if the connection drops, it waits for the bot to log in again, warps
+--   back into this world (retrying for as long as it takes), walks back to the last work position and carries on.
+--   (Needs Mori's auto-reconnect to be ON.) A tile that will not break is retried again and again.
+-- SPEED: every getTile / getObjects / getLocal call costs a round trip to the bot thread (about 10 ms), so the
+--   script reads the whole world from ONE snapshot (bot:getWorld()) whenever it needs many tiles at once.
+-- Lua in Mori has no clock, so the tree growth time is ESTIMATED (every action adds its delay, every sleep adds
+--   its exact length; walking is not counted, so the estimate errs on the slow side).
+-- Safe to run again on a world that is already partly done. Main door and bedrock are never hit. No file functions.
+-- ===== Settings =====
+local TARGET_WORLD   = "HFYA2" -- the world to work in; the bot enters it when it is not inside (nil = use the current one)
+local WORLD_W        = 100    -- columns 0..99
+local X_FROM         = 1      -- first column of every platform row (columns 0 and 99 stay open)
+local X_TO           = 98     -- last column of every platform row
+local TOP_Y          = nil    -- first dirt row (nil = main door row + 1; 24 in a new world)
+local LAST_Y         = nil    -- last diggable row above bedrock (nil = detect; 53 in a new world)
+local BUILD_TOP      = true   -- also build platform rows above the dirt layer
+local BUILD_MIN_Y    = 0      -- highest (smallest y) platform row to build
+local CLEAR_BG       = true   -- also break the background (cave) of every dug tile
+local FILL_LAVA      = true   -- break lava seen in the platform rows and fill the hole with Dirt
+local LAVA_ID        = 4      -- item id of Lava (the name is printed at the start so you can check it)
+local DIRT_ID        = 2
+local SEED_ID        = 3
+local STACK_CAP      = 200    -- the most of one item the backpack can hold
+local DIRT_RESERVE   = 30     -- Dirt kept back when the surplus is dropped (for filling lava holes)
+local SEED_RESERVE   = 20     -- Dirt Seeds kept back while the top is still unfinished
+local GROW_S         = 30     -- Dirt Seed growth time in seconds (nil = read it from items.dat)
+local REACH          = 2      -- how many tiles away the server accepts a hit/place (try 3 if all goes well)
+local BREAK_ATTEMPTS = 3      -- tries per tile and round (MAX_PUNCH hits each); then the whole round repeats
+local BREAK_PAUSE_MAX_S = 20  -- the pause between repeated break rounds grows up to this many seconds
+local MAX_VERIFY_PASSES = 10  -- repair passes of a check before going on anyway
+local FINAL_TAKE_SURFACE_DROPS = false  -- at the very end also pick up what lies on the surface (the depot)
+local DIRT_BATCH     = 190    -- while building, fetch Dirt from the depot until holding this much
+local MAX_PLANT      = 16     -- seeds planted per farming round
+local MAX_WAIT_S     = 1800   -- do not accept a growth time longer than this
+local FARM_MARGIN_S  = 5      -- extra seconds on top of the grow time (raise to 8-10 if trees get punched too early)
+local MAX_FARM_ROUNDS = 10
+local MAX_REJOIN     = 10     -- warp attempts in a row before a longer pause (it never gives up)
+local REJOIN_PAUSE_S = 60     -- that longer pause
+local WALK_RETRIES   = 8      -- attempts for one walk before the failure is reported (2 s apart)
+local MAX_SOFT       = 40     -- connection-type failures in a row before the script finally stops
+local GUARD_EVERY    = 12     -- full connection check every this many ticks (a dropped connection is seen at once)
+local AVOID          = { [6] = true, [8] = true }   -- main door, bedrock: never hit
+local MAX_PUNCH      = 12     -- punches per attempt (block and background together)
+local PLACE_DELAY_MS = 100    -- the bot's own delay after each hit/place
+local COLLECT_TILES  = 5      -- pickup radius in tiles
+local MAX_TRIES      = 2      -- give up on an object after this many pickup attempts
+local FULL_MARGIN    = 3      -- the backpack counts as full with this many free slots left or fewer
+local KEEP           = { [18] = true, [32] = true, [98] = true, [112] = true, [2] = true, [3] = true }
+                              -- never dropped completely: fist, wrench, pickaxe, gems, Dirt, Dirt Seed
+local DOOR_SPOT_DX   = 2      -- drop this many tiles beside the main door (shifts a bit on every trip)
+local USE_PICKAXE    = true
+local PICKAXE_ID     = 98
+local PICKAXE_MSG    = "Enhanced Digging"
+
+-- ===== Setup =====
+local bot = getBot()
+bot:setAutoCollect(false)     -- this script collects explicitly
+bot.place_delay = PLACE_DELAY_MS
+
+-- shared state (declared early because the reconnect code touches it)
+local WORLD_NAME = nil        -- set once the bot is in the world
+local lastX, lastY = nil, nil -- last position seen while online
+local recovering = false
+local recoveries = 0
+local tried = {}              -- object id -> pickup attempts
+local softFails, breakRetries = 0, 0
+local guardTicks = 0
+local guard                   -- assigned below, called from tick()
+local farm = { active = false, planted = {}, estMs = 0 }   -- trees being grown + estimated growth time
+
+-- ===== Pickaxe (optional) =====
+local pickaxeOn = false
+addEvent(Event.variantlist, function(vl, net_id)
+  if vl:get(0):getString() == "OnConsoleMessage" then
+    local msg = vl:get(1):getString()
+    if msg:find(PICKAXE_MSG, 1, true) then
+      if msg:find("removed", 1, true) then pickaxeOn = false
+      elseif msg:find("added", 1, true) then pickaxeOn = true end
+    end
+  end
+end)
+
+-- Processes game events, advances the tree growth estimate and checks that we are still connected.
+local function tick()
+  listenEvents(0.02)
+  if farm.active then farm.estMs = farm.estMs + PLACE_DELAY_MS + 40 end
+  guard()
+end
+
+local havePickaxe = USE_PICKAXE and getInventory():findItem(PICKAXE_ID) > 0
+local pickaxeGaveUp = false
+local function ensurePickaxe()
+  if not havePickaxe or pickaxeGaveUp then return end
+  tick()
+  if pickaxeOn then return end
+  for attempt = 1, 2 do
+    bot:wear(PICKAXE_ID)
+    for i = 1, 20 do
+      listenEvents(0.25)
+      if pickaxeOn then return end
+    end
+  end
+  pickaxeGaveUp = true
+  print("Could not confirm the pickaxe, continuing without it.")
+end
+
+-- ===== Helpers =====
+local function botTile()
+  local me = getLocal()
+  return math.floor(me.posx / 32), math.floor(me.posy / 32)
+end
+
+local function tileFg(tx, ty)
+  if tx < 0 or ty < 0 then return nil end
+  local t = getTile(tx, ty)
+  return t and t.fg or nil
+end
+
+local function itemName(id)
+  local i = getInfo(id)
+  return i and i.name or tostring(id)
+end
+
+local function sgn(v)
+  if v > 0 then return 1 elseif v < 0 then return -1 end
+  return 0
+end
+
+-- Walks to (x, y) (blocks until arrival); true if the bot ended up within 1 tile of it.
+-- A failed walk or a reconnect on the way simply repeats the walk (connection hiccups are expected).
+local function goTo(x, y)
+  for try = 1, WALK_RETRIES do
+    guard(true)
+    local rc = recoveries
+    bot:findPath(x, y)
+    tick()
+    if recoveries == rc then
+      local bx, by = botTile()
+      if math.abs(bx - x) <= 1 and math.abs(by - y) <= 1 then return true end
+      if try < WALK_RETRIES then sleep(2000) end
+    end
+  end
+  return false
+end
+
+-- ===== Reconnect handling (never gives up) =====
+local function online()
+  return bot.status == "in_game" and bot:isInWorld(WORLD_NAME)
+end
+
+local function recover()
+  recovering = true
+  recoveries = recoveries + 1
+  print("Connection lost (status: " .. tostring(bot.status) .. "), waiting for the reconnect...")
+  local offlineS, joinTries = 0, 0
+  while true do
+    if bot.status == "in_game" then
+      if bot:isInWorld(WORLD_NAME) then break end
+      joinTries = joinTries + 1
+      print("Re-entering world " .. WORLD_NAME .. " (try " .. joinTries .. ")")
+      bot:warp(WORLD_NAME)
+      for i = 1, 40 do
+        sleep(500)
+        if bot:isInWorld(WORLD_NAME) then break end
+      end
+      if bot:isInWorld(WORLD_NAME) then break end
+      if joinTries % MAX_REJOIN == 0 then
+        print("Still not in " .. WORLD_NAME .. ", pausing " .. REJOIN_PAUSE_S .. "s before trying again.")
+        sleep(REJOIN_PAUSE_S * 1000)
+      else
+        sleep(5000)
+      end
+    else
+      sleep(2000)
+      offlineS = offlineS + 2
+      if offlineS % 60 == 0 then
+        print("Still offline after " .. offlineS .. "s (status: " .. tostring(bot.status) .. "), still waiting.")
+      end
+    end
+  end
+
+  print("Back in " .. WORLD_NAME .. ".")
+  sleep(1500)                                    -- let the world and inventory finish loading
+  pickaxeOn = false                              -- the effect may be gone; ensurePickaxe checks again
+  tried = {}
+  bot:setAutoCollect(false)
+  bot.place_delay = PLACE_DELAY_MS
+  if lastX then
+    if goTo(lastX, lastY) then
+      print("Back at the work position " .. lastX .. "," .. lastY .. ", continuing.")
+    else
+      print("Could not walk back to " .. lastX .. "," .. lastY .. ", continuing from here.")
+    end
+  end
+  recovering = false
+end
+
+-- The status is read without a request, so a dropped connection is noticed on every tick; the full check
+-- (and the remembered work position) is refreshed every GUARD_EVERY ticks or when force is set.
+guard = function(force)
+  if recovering or not WORLD_NAME then return end
+  if bot.status ~= "in_game" then
+    recover()
+    return
+  end
+  guardTicks = guardTicks + 1
+  if force or guardTicks % GUARD_EVERY == 0 then
+    if online() then
+      lastX, lastY = botTile()
+    else
+      recover()
+    end
+  end
+end
+
+-- Breaks the block on the absolute tile (x, y), and its background when CLEAR_BG is on (unless fgOnly).
+-- Retries; steps next to it along the row when it will not break.
+local function breakTile(x, y, fgOnly)
+  local withBg = CLEAR_BG and not fgOnly
+  local t = getTile(x, y)
+  if x < 0 or y < 0 or not t then return false, "Tile " .. x .. "," .. y .. " is outside the world." end
+  local fg, bg = t.fg, withBg and t.bg or 0
+  if fg == 0 and bg == 0 then return true end
+  if fg ~= 0 and AVOID[fg] then
+    return false, "Tile " .. x .. "," .. y .. " is " .. itemName(fg) .. ", which is never touched."
+  end
+
+  local punches = 0
+  for attempt = 1, BREAK_ATTEMPTS do
+    local bx, by = botTile()
+    local dx, dy = x - bx, y - by
+    if (math.abs(dx) > REACH or math.abs(dy) > REACH) and dy == 0 then
+      goTo(x - sgn(dx), y)                       -- too far along the row: step next to the tile
+      bx, by = botTile()
+      dx, dy = x - bx, y - by
+    end
+    if math.abs(dx) > REACH or math.abs(dy) > REACH then
+      return false, "Could not walk close enough to tile " .. x .. "," .. y .. " (out of reach from " .. bx .. "," .. by .. ")."
+    end
+    local n = 0
+    while (fg ~= 0 or bg ~= 0) and n < MAX_PUNCH do
+      ensurePickaxe()
+      bot:hit(dx, dy)                            -- first the block, then the background behind it
+      n = n + 1
+      punches = punches + 1
+      tick()
+      local nt = getTile(x, y)
+      fg = nt and nt.fg or 0
+      bg = (withBg and nt) and nt.bg or 0
+    end
+    if fg == 0 and bg == 0 then return true end
+    if attempt < BREAK_ATTEMPTS and dy == 0 and math.abs(dx) > 1 then
+      goTo(x - sgn(dx), y)                       -- next attempt from right beside the tile
+    end
+  end
+  local what = (fg ~= 0) and itemName(fg) or ("background " .. itemName(bg))
+  return false, "Could not break tile " .. x .. "," .. y .. " (" .. what .. ") after " .. punches
+    .. " hits. Check the [Bubble] messages above."
+end
+
+-- Failures that come from the connection / walking and are simply retried.
+local function isSoft(why)
+  return why ~= nil and (why:find("Could not walk", 1, true) ~= nil
+    or why:find("Could not step", 1, true) ~= nil
+    or why:find("Could not re-enter", 1, true) ~= nil)
+end
+
+local function isBreakFail(why)
+  return why ~= nil and why:find("Could not break tile", 1, true) ~= nil
+end
+
+-- Stand positions along x0..x1, every 2*REACH+1 tiles, in walking order.
+local function standList(x0, x1, dir)
+  local list = {}
+  local sx = x0
+  while sx <= x1 do
+    list[#list + 1] = math.min(sx + REACH, x1)
+    sx = sx + 2 * REACH + 1
+  end
+  if dir < 0 then
+    local rev = {}
+    for i = #list, 1, -1 do rev[#rev + 1] = list[i] end
+    list = rev
+  end
+  return list
+end
+
+-- ===== STEP 0: make sure the bot is inside the world =====
+do
+  if TARGET_WORLD and TARGET_WORLD ~= "" then
+    if bot.status == "in_game" and bot:isInWorld(TARGET_WORLD) then
+      print("Already inside " .. TARGET_WORLD .. ", starting from the current position.")
+    else
+      local tries = 0
+      while not (bot.status == "in_game" and bot:isInWorld(TARGET_WORLD)) do
+        if bot.status == "in_game" then
+          tries = tries + 1
+          print("Entering " .. TARGET_WORLD .. " (try " .. tries .. ")")
+          bot:warp(TARGET_WORLD)
+          for i = 1, 40 do
+            sleep(500)
+            if bot.status == "in_game" and bot:isInWorld(TARGET_WORLD) then break end
+          end
+          if not (bot.status == "in_game" and bot:isInWorld(TARGET_WORLD)) then sleep(5000) end
+        else
+          sleep(2000)                              -- still logging in
+        end
+      end
+      sleep(2000)                                  -- let the world finish loading
+      print("Entered " .. TARGET_WORLD .. ", the bot stands at the white door.")
+    end
+    WORLD_NAME = TARGET_WORLD
+  else
+    while not (bot.status == "in_game" and bot:isInWorld()) do
+      print("Waiting to be in a world...")
+      sleep(2000)
+    end
+    local w = bot:getWorld()
+    WORLD_NAME = w and w.name or nil
+    if not WORLD_NAME or WORLD_NAME == "" or WORLD_NAME == "EXIT" then
+      print("Could not read the world name, stopping (set TARGET_WORLD in the settings).")
+      return
+    end
+  end
+  lastX, lastY = botTile()
+  print("World: " .. WORLD_NAME .. " (the script re-enters it after a reconnect)")
+end
+
+if FILL_LAVA then
+  local li = getInfo(LAVA_ID)
+  local lname = li and li.name or "?"
+  print("Lava id " .. LAVA_ID .. " = " .. lname .. (lname:lower():find("lava", 1, true) and "" or "  <-- does not look like lava, check LAVA_ID"))
+end
+
+-- main door position and the dirt layer (read from one snapshot of the world)
+local doorX, doorY
+local startWorld = bot:getWorld()
+for y = 0, 59 do
+  for x = 0, WORLD_W - 1 do
+    local t = startWorld:getTile(x, y)
+    if t and t.fg == 6 then doorX, doorY = x, y break end
+  end
+  if doorX then break end
+end
+
+local function countInRow(y, id)                 -- tiles of the row holding item id (id nil = any block)
+  local n = 0
+  for x = 0, WORLD_W - 1 do
+    local t = startWorld:getTile(x, y)
+    local fg = t and t.fg
+    if fg and ((id == nil and fg ~= 0 and fg ~= 6) or (id ~= nil and fg == id)) then n = n + 1 end
+  end
+  return n
+end
+
+if not TOP_Y then
+  if doorY then
+    TOP_Y = doorY + 1
+  else
+    for y = 0, 59 do                             -- fallback: the first row that is mostly filled
+      if countInRow(y, nil) >= WORLD_W * 0.3 then TOP_Y = y break end
+    end
+  end
+end
+if not LAST_Y and TOP_Y then
+  for y = TOP_Y, 59 do
+    if countInRow(y, 8) >= WORLD_W * 0.5 then LAST_Y = y - 1 break end   -- the bedrock rows
+  end
+end
+if not TOP_Y or not LAST_Y or LAST_Y - TOP_Y < 4 then
+  print("Could not detect the dirt layer (TOP_Y=" .. tostring(TOP_Y) .. ", LAST_Y=" .. tostring(LAST_Y)
+    .. "), using 24 and 53. Set them by hand in the settings if your world differs.")
+  TOP_Y, LAST_Y = 24, 53
+end
+print("Dirt layer y=" .. TOP_Y .. ".." .. LAST_Y .. ": platform rows stay at y=" .. TOP_Y .. ", " .. (TOP_Y + 2)
+  .. ", ..., gap rows (cleared) at y=" .. (TOP_Y + 1) .. ", " .. (TOP_Y + 3) .. ", ...  (reach " .. REACH
+  .. ", background " .. (CLEAR_BG and "cleared" or "kept") .. ")")
+
+if doorX then
+  print("Main door at " .. doorX .. "," .. doorY)
+else
+  doorX, doorY = 0, TOP_Y - 1
+  print("Main door not found, using the surface at " .. doorX .. "," .. doorY .. " as the drop spot.")
+end
+
+-- ===== Build bookkeeping (needed by the backpack code too) =====
+local bi = 0                                     -- index of the next platform row to build
+local function buildPy(k) return TOP_Y - 2 - 2 * k end
+local function buildRemaining() return BUILD_TOP and buildPy(bi) >= BUILD_MIN_Y end
+
+-- ===== Collect =====
+local needDrop = false
+local collected = 0
+-- minY: ignore objects above this row (our own drops lie on the surface); only: optional set of item ids.
+local function collectAll(minY, only)
+  local inv = getInventory()
+  local me = getLocal()
+  local r2 = (COLLECT_TILES * 32) ^ 2
+  for _, o in ipairs(getObjects()) do
+    local oy = math.floor(o.y / 32)
+    if oy >= minY and (not only or only[o.id]) and (tried[o.oid] or 0) < MAX_TRIES then
+      local dx, dy = o.x - me.posx, o.y - me.posy
+      if dx * dx + dy * dy <= r2 then
+        if inv:canCollect(o.id) then
+          tried[o.oid] = (tried[o.oid] or 0) + 1
+          bot:collectObject(o.oid, COLLECT_TILES)   -- the range argument is in TILES
+          collected = collected + 1
+          tick()
+        elseif not KEEP[o.id] then
+          needDrop = true                           -- something else could not be picked up: backpack is full
+        end
+      end
+    end
+  end
+end
+
+-- Full = slots almost used up, something could not be picked up, or Dirt / Dirt Seed at the stack cap.
+local function backpackFull()
+  local inv = getInventory()
+  return needDrop
+    or inv.itemcount >= inv.slotcount - FULL_MARGIN
+    or inv:findItem(DIRT_ID) >= STACK_CAP
+    or inv:findItem(SEED_ID) >= STACK_CAP
+end
+
+-- How much of a stack is dropped at the door.
+local function dropAmount(it)
+  if not KEEP[it.id] then return it.count end                      -- everything else goes
+  if it.id == DIRT_ID and it.count >= STACK_CAP then return it.count - DIRT_RESERVE end
+  if it.id == SEED_ID and it.count >= STACK_CAP then
+    return it.count - (buildRemaining() and SEED_RESERVE or 0)
+  end
+  return 0                                                          -- fist, wrench, pickaxe, gems, Dirt/Seed below the cap
+end
+
+-- ===== Holes left by broken lava: fill them with Dirt =====
+local lavaQueue = {}                             -- { x, y, gy, tries }: holes waiting for Dirt
+local lavaBroken, lavaFilled = 0, 0
+
+-- Places Dirt into the queued holes (walks there if needed, then back).
+local function fillLava()
+  if #lavaQueue == 0 then return true end
+  local startX, startY = botTile()
+  local moved = false
+  local keep = {}
+  for _, e in ipairs(lavaQueue) do
+    local fg = tileFg(e.x, e.y)
+    if fg == DIRT_ID then
+      lavaFilled = lavaFilled + 1                  -- done
+    elseif fg == 0 then
+      if e.tries >= 6 then
+        print("Giving up filling the hole at " .. e.x .. "," .. e.y .. " after " .. e.tries .. " tries.")
+      elseif getInventory():findItem(DIRT_ID) > 0 then
+        e.tries = e.tries + 1
+        local bx, by = botTile()
+        if not (math.abs(e.x - bx) <= REACH and by == e.gy) then
+          if not goTo(e.x, e.gy) then return false, "Could not walk to " .. e.x .. "," .. e.gy .. " to fill the lava hole." end
+          moved = true
+          bx, by = botTile()
+        end
+        bot:place(e.x - bx, e.y - by, DIRT_ID)
+        tick()
+        keep[#keep + 1] = e                        -- checked again next time
+      else
+        keep[#keep + 1] = e                        -- no Dirt yet: wait for more
+      end
+    end                                            -- any other block there: nothing left to do
+  end
+  lavaQueue = keep
+  if moved then
+    if not goTo(startX, startY) then return false, "Could not walk back to " .. startX .. "," .. startY .. " after filling lava." end
+  end
+  return true
+end
+
+-- ===== Empty the backpack beside the main door, then return =====
+local trips = 0
+local function emptyBackpack()
+  local sx, sy = botTile()
+  trips = trips + 1
+  local spotX = math.min(doorX + DOOR_SPOT_DX + (trips % 6), WORLD_W - 1)
+  print("Backpack full, walking to the main door to drop items (trip " .. trips .. ")")
+  local atDoor = false
+  for try = 1, 3 do                              -- repeated because a reconnect on the way resets the position
+    if goTo(spotX, doorY) then
+      local bx, by = botTile()
+      if math.abs(bx - spotX) <= 1 and by == doorY then atDoor = true break end
+    end
+  end
+  if not atDoor then return false, "Could not walk to the main door at " .. spotX .. "," .. doorY .. "." end
+
+  local stacks = {}
+  for _, it in ipairs(getInventory():getItems()) do
+    local amount = dropAmount(it)
+    if amount > 0 then stacks[#stacks + 1] = { id = it.id, count = amount } end
+  end
+  for _, s in ipairs(stacks) do
+    local before = getInventory():findItem(s.id)
+    bot:fastDrop(s.id, s.count)
+    listenEvents(0.3)
+    if getInventory():findItem(s.id) >= before then      -- fast drop did not work: use the normal drop dialog
+      bot:drop(s.id, s.count)
+      listenEvents(0.6)
+    end
+  end
+  listenEvents(0.5)
+  needDrop = false
+  tried = {}
+
+  local inv = getInventory()
+  if inv.itemcount >= inv.slotcount - FULL_MARGIN then
+    return false, "Backpack is still full after dropping (items that cannot be dropped?)."
+  end
+  print("Dropped " .. #stacks .. " stack(s), walking back to " .. sx .. "," .. sy)
+  if not goTo(sx, sy) then return false, "Could not walk back to " .. sx .. "," .. sy .. " after dropping." end
+  return true
+end
+
+local function service()
+  collectAll(TOP_Y)
+  local okL, whyL = fillLava()                   -- Dirt first goes into broken lava holes
+  if not okL then return false, whyL end
+  if backpackFull() then return emptyBackpack() end
+  return true
+end
+
+-- ===== Build the upper world (platform rows above the dirt layer) =====
+local function missingInRow(py, w)
+  w = w or bot:getWorld()
+  local n = 0
+  for tx = X_FROM, X_TO do
+    local t = w:getTile(tx, py)
+    if t and t.fg == 0 then n = n + 1 end
+  end
+  return n
+end
+
+local placedDirt = 0
+
+-- Places Dirt on the tile (tx, py) and does NOT give up until the tile is filled (or the Dirt runs out).
+-- Returns true when the tile is filled, false when there is no Dirt left.
+local function placeFirm(tx, py, standX, gy)
+  local tries = 0
+  while true do
+    local fg = tileFg(tx, py)
+    if fg ~= 0 then return true end                  -- filled (or outside the world)
+    if getInventory():findItem(DIRT_ID) <= 0 then return false end
+    tries = tries + 1
+    local bx, by = botTile()
+    if tries % 4 == 0 or math.abs(tx - bx) > REACH or math.abs(py - by) > REACH then
+      goTo(standX, gy)                               -- stand in the right place again
+      bx, by = botTile()
+    end
+    bot:place(tx - bx, py - by, DIRT_ID)             -- offset from where the bot REALLY stands
+    if farm.active then farm.estMs = farm.estMs + PLACE_DELAY_MS + 40 end
+    for i = 1, 6 do                                  -- wait up to ~1.2 s for the server
+      listenEvents(0.2)
+      guard()
+      if tileFg(tx, py) ~= 0 then
+        placedDirt = placedDirt + 1
+        return true
+      end
+    end
+    if tries % 5 == 0 then
+      print("Dirt at " .. tx .. "," .. py .. " not placed yet (try " .. tries .. ", bot at " .. bx .. "," .. by
+        .. "), trying again")
+      sleep(math.min(tries, 10) * 200)
+    end
+  end
+end
+
+-- Builds rows while dirt lasts, then returns to where it was. stopWhen() (optional) is checked after every
+-- stand position; when it returns true the bot stops building so the trees can be harvested.
+local function buildSome(stopWhen)
+  local sx, sy = botTile()
+  local attempts = {}
+  local halt = false
+  while buildRemaining() and not halt do
+    local py = buildPy(bi)
+    local gy = py + 1                            -- the gap row the bot stands in (floor = the row below it)
+    if missingInRow(py) == 0 then
+      print("Top row y=" .. py .. " done")
+      bi = bi + 1
+    else
+      if getInventory():findItem(DIRT_ID) <= 0 then break end
+      attempts[py] = (attempts[py] or 0) + 1
+      if attempts[py] > 4 and not (stopWhen and stopWhen()) then
+        return false, "Top row y=" .. py .. " still has empty tiles after several passes. Check [Bubble] messages."
+      end
+      for _, px in ipairs(standList(X_FROM, X_TO, (bi % 2 == 0) and 1 or -1)) do
+        if not goTo(px, gy) then
+          return false, "Could not walk to " .. px .. "," .. gy .. ". Keep the edge columns open so the bot can climb."
+        end
+        local outOfDirt = false
+        local w = bot:getWorld()                 -- one snapshot to find the empty tiles around this position
+        for dx = -REACH, REACH do
+          local tx = px + dx
+          local t = (tx >= X_FROM and tx <= X_TO) and w:getTile(tx, py) or nil
+          if t and t.fg == 0 then
+            if not placeFirm(tx, py, px, gy) then outOfDirt = true break end   -- stays here until it is placed
+          end
+        end
+        tick()
+        if outOfDirt then break end
+        if stopWhen and stopWhen() then halt = true break end
+      end
+    end
+  end
+  if not goTo(sx, sy) then return false, "Could not walk back to " .. sx .. "," .. sy .. " after building." end
+  return true
+end
+
+-- Dirt / Dirt Seeds lying on the surface (the depot beside the main door).
+local DEPOT_ONLY = { [DIRT_ID] = true, [SEED_ID] = true }
+local function depotObjects()
+  local list = {}
+  for _, o in ipairs(getObjects()) do
+    if DEPOT_ONLY[o.id] and math.floor(o.y / 32) < TOP_Y and (tried[o.oid] or 0) < MAX_TRIES then
+      list[#list + 1] = o
+    end
+  end
+  return list
+end
+
+-- Walks over the depot and picks up Dirt / Seeds until the backpack holds DIRT_BATCH dirt or nothing is left.
+local function gatherDepot()
+  tried = {}
+  for round = 1, 60 do
+    if getInventory():findItem(DIRT_ID) >= DIRT_BATCH then break end
+    local list = depotObjects()
+    if #list == 0 then break end
+    local me = getLocal()
+    local best, bestD
+    for _, o in ipairs(list) do
+      local dx, dy = o.x - me.posx, o.y - me.posy
+      local d = dx * dx + dy * dy
+      if not bestD or d < bestD then best, bestD = o, d end
+    end
+    if not goTo(math.floor(best.x / 32), math.floor(best.y / 32)) then
+      return false, "Could not walk to the dropped Dirt at " .. math.floor(best.x / 32) .. "," .. math.floor(best.y / 32) .. "."
+    end
+    collectAll(0, DEPOT_ONLY)
+    tried[best.oid] = (tried[best.oid] or 0) + 1   -- never loop forever on one object
+  end
+  return true
+end
+
+-- ===== Farm Dirt Seeds on the surface row (planting and harvesting are separate steps) =====
+local farmRounds = 0
+
+local function growMs()
+  local info = getInfo(SEED_ID)
+  return ((GROW_S or (info and info.grow_time) or 0) + FARM_MARGIN_S) * 1000
+end
+
+local function treesReady() return farm.active and farm.estMs >= growMs() end
+
+-- Dirt still missing in all unfinished top rows.
+local function neededDirt()
+  local w0 = bot:getWorld()
+  local need, k = 0, bi
+  while BUILD_TOP and buildPy(k) >= BUILD_MIN_Y do
+    need = need + missingInRow(buildPy(k), w0)
+    k = k + 1
+  end
+  return need
+end
+
+-- Dirt lying in the depot (beside the main door).
+local function depotDirt()
+  local n = 0
+  for _, o in ipairs(depotObjects()) do
+    if o.id == DIRT_ID then n = n + (o.count or 1) end
+  end
+  return n
+end
+
+-- Plants seeds on the surface row and starts the growth clock. Does NOT wait.
+local function plantSeeds()
+  local seeds = getInventory():findItem(SEED_ID)
+  if seeds <= 0 then
+    return false, "Out of dirt and no Dirt Seeds to plant. About " .. neededDirt() .. " dirt missing for the top rows."
+  end
+  if growMs() / 1000 > MAX_WAIT_S then
+    return false, "A Dirt tree needs " .. (growMs() / 1000) .. "s to grow, more than MAX_WAIT_S (" .. MAX_WAIT_S .. ")."
+  end
+  farmRounds = farmRounds + 1
+
+  local sy = TOP_Y - 1                           -- surface row (gap row above the first platform row)
+  local farmX0 = X_FROM + 2
+  local span = 2 * REACH + 1
+  local plan = {}
+  local tx = farmX0
+  while #plan < math.min(seeds, MAX_PLANT) and tx <= X_TO do
+    local m = math.floor((tx - farmX0) / span)
+    local sx = farmX0 + REACH + span * m
+    local dx = tx - sx
+    if dx ~= 0 and tileFg(tx, sy) == 0 then plan[#plan + 1] = { tx = tx, sx = sx, dx = dx } end
+    tx = tx + 1
+  end
+
+  print("Farming round " .. farmRounds .. ": planting " .. #plan .. " Dirt Seed(s), growth " .. (growMs() / 1000)
+    .. "s. Building continues meanwhile.")
+  local planted = {}
+  local seedsBefore = getInventory():findItem(SEED_ID)
+  for _, p in ipairs(plan) do
+    if not goTo(p.sx, sy) then return false, "Could not walk to the planting spot " .. p.sx .. "," .. sy .. "." end
+    local bx, by = botTile()
+    bot:place(p.tx - bx, sy - by, SEED_ID)       -- offset from where the bot REALLY stands
+    local ok = false
+    for i = 1, 8 do                              -- wait up to 2 s for the server to confirm
+      listenEvents(0.25)
+      guard()
+      if tileFg(p.tx, sy) == SEED_ID then ok = true break end
+    end
+    if ok then
+      planted[#planted + 1] = p
+    else
+      print("Seed at " .. p.tx .. "," .. sy .. " not visible (bot at " .. bx .. "," .. by .. ", tile fg "
+        .. tostring(tileFg(p.tx, sy)) .. ", tile below fg " .. tostring(tileFg(p.tx, sy + 1)) .. ")")
+    end
+  end
+  if #planted == 0 and getInventory():findItem(SEED_ID) < seedsBefore then
+    planted = plan                               -- the seeds were used up, only the tile update is missing
+  end
+  if #planted == 0 then return false, "No seed could be planted on the surface row. Check [Bubble] messages." end
+  farm.planted, farm.estMs, farm.active = planted, 0, true
+  return true
+end
+
+-- Harvests every planted tree and picks up everything it dropped.
+local function harvestTrees()
+  local sy = TOP_Y - 1
+  local only = { [DIRT_ID] = true, [SEED_ID] = true, [112] = true }
+  print("Trees are ready, harvesting " .. #farm.planted .. " tree(s)")
+  for _, p in ipairs(farm.planted) do
+    if not goTo(p.sx, sy) then return false, "Could not walk to the tree at " .. p.tx .. "," .. sy .. "." end
+    local punches = 0
+    while tileFg(p.tx, sy) == SEED_ID and punches < MAX_PUNCH do
+      ensurePickaxe()
+      local bx, by = botTile()
+      bot:hit(p.tx - bx, sy - by)
+      punches = punches + 1
+      tick()
+    end
+    tried = {}
+    collectAll(0, only)
+  end
+  farm.planted, farm.active = {}, false
+  print("Harvest done, dirt now " .. getInventory():findItem(DIRT_ID) .. ", seeds " .. getInventory():findItem(SEED_ID))
+  return true
+end
+
+-- ===== Retrying =====
+-- Handles a failure. A tile that will not break is tried again with a growing pause and NEVER ends the script.
+-- Connection/walking problems end it only after MAX_SOFT in a row. Returns false when it finally gives up.
+local function retryLater(why)
+  if isBreakFail(why) then
+    breakRetries = breakRetries + 1
+    local pause = math.min(2 * breakRetries, BREAK_PAUSE_MAX_S)
+    print(tostring(why) .. " -> trying again in " .. pause .. "s (round " .. breakRetries .. ")")
+    sleep(pause * 1000)
+  else
+    softFails = softFails + 1
+    print("Connection/walking problem: " .. tostring(why) .. " -> retrying (" .. softFails .. "/" .. MAX_SOFT .. ")")
+    if softFails >= MAX_SOFT then return false end
+    sleep(5000)
+  end
+  guard(true)
+  if lastX then goTo(lastX, lastY) end
+  return true
+end
+
+-- Runs fn() until it succeeds. Break and connection problems are retried; anything else is returned as a failure.
+local function runRetry(fn)
+  while true do
+    local ok, why = fn()
+    if ok then
+      softFails, breakRetries = 0, 0
+      return true
+    end
+    if isSoft(why) or isBreakFail(why) then
+      if not retryLater(why) then return false, "Too many connection/walking problems in a row: " .. tostring(why) end
+    else
+      return false, why
+    end
+  end
+end
+
+-- ===== Rows and work (nearest first) =====
+-- Row pattern: platform rows at y = TOP_Y + 2k (between BUILD_MIN_Y and LAST_Y-1), gap rows between them.
+local function rowKind(y)
+  if y < BUILD_MIN_Y or y > LAST_Y then return nil end
+  if (y - TOP_Y) % 2 == 0 then
+    if y <= LAST_Y - 1 then return "platform" end
+    return nil
+  end
+  return "gap"
+end
+
+-- Gap rows (the surface row included) sit at y = TOP_Y - 1 + 2k.
+local function gapY(k) return TOP_Y - 1 + 2 * k end
+local function gapIndexOf(y) return math.floor((y - (TOP_Y - 1) + 1) / 2) end
+
+-- The gap row a dropped item belongs to.
+local function dropRow(oy)
+  if (oy - TOP_Y) % 2 == 1 then return oy end
+  if oy + 1 <= LAST_Y then return oy + 1 end
+  return oy - 1
+end
+
+local function tileDirty(t)
+  return t and ((t.fg ~= 0 and t.fg ~= 6) or (CLEAR_BG and t.bg ~= 0))
+end
+
+-- Everything that still has to be done for the gap row gy (read from the snapshot w):
+--   dirty tiles in the row, the open ends of the platform row above it, lava in that platform row,
+--   and item drops that belong to the row.
+local function rowTasks(gy, includeTop, w)
+  w = w or bot:getWorld()
+  local first = includeTop and BUILD_MIN_Y or TOP_Y
+  local tasks = {}
+  for x = 0, WORLD_W - 1 do
+    local t = w:getTile(x, gy)
+    if tileDirty(t) then tasks[#tasks + 1] = { kind = "dirty", x = x, y = gy } end
+  end
+  local py = gy - 1
+  if py >= first and rowKind(py) == "platform" then
+    for _, ex in ipairs({ 0, WORLD_W - 1 }) do
+      local t = w:getTile(ex, py)
+      if t and (t.fg ~= 0 or (CLEAR_BG and t.bg ~= 0)) then tasks[#tasks + 1] = { kind = "dirty", x = ex, y = py } end
+    end
+    if FILL_LAVA then
+      for x = X_FROM, X_TO do
+        local t = w:getTile(x, py)
+        if t and t.fg == LAVA_ID then tasks[#tasks + 1] = { kind = "lava", x = x, y = py } end
+      end
+    end
+  end
+  for _, o in ipairs(w:getObjects()) do
+    local oy = math.floor(o.y / 32)
+    if oy >= TOP_Y and dropRow(oy) == gy and (tried[o.oid] or 0) < MAX_TRIES then
+      tasks[#tasks + 1] = { kind = "drop", x = math.floor(o.x / 32), y = oy, oid = o.oid }
+    end
+  end
+  return tasks
+end
+
+-- The row with work that is nearest to the bot (nil when there is no work left).
+local function pickNextRow(includeTop)
+  local bx, by = botTile()
+  local w = bot:getWorld()                       -- one snapshot for all rows
+  local kMax = math.floor((LAST_Y - (TOP_Y - 1)) / 2)
+  local kMin = 1
+  if includeTop then kMin = math.ceil((BUILD_MIN_Y - TOP_Y + 1) / 2) end
+  local best, bestKey
+  for k = kMin, kMax do
+    local y = gapY(k)
+    if y >= 0 and y <= LAST_Y and rowKind(y) == "gap" then
+      local tasks = rowTasks(y, includeTop, w)
+      if #tasks > 0 then
+        local minX = WORLD_W
+        for _, t in ipairs(tasks) do
+          local d = math.abs(t.x - bx)
+          if d < minX then minX = d end
+        end
+        local key = math.abs(y - by) * 1000 + minX
+        if not bestKey or key < bestKey then best, bestKey = y, key end
+      end
+    end
+  end
+  return best
+end
+
+-- Moves the bot to the gap row gy, one row at a time, through the edge columns (digs a shaft where there is none).
+local function moveToRow(gy)
+  local kt = math.floor((gy - (TOP_Y - 1)) / 2)
+  for guardLoop = 1, 200 do
+    local bx, by = botTile()
+    local k = gapIndexOf(by)
+    if by ~= gapY(k) then
+      goTo(bx, gapY(k))                            -- not exactly in a gap row (e.g. inside a shaft): step into it
+      bx, by = botTile()
+    end
+    if k == kt then return true end
+    local nk = k + sgn(kt - k)
+    local yc, yn = gapY(k), gapY(nk)
+    local py = (yc + yn) // 2                      -- the platform row between the two gap rows
+    local e = (bx <= WORLD_W // 2) and 0 or (WORLD_W - 1)
+    if not goTo(e, yc) then return false, "Could not walk to the edge " .. e .. "," .. yc .. "." end
+    local ok1, w1 = breakTile(e, py)
+    if not ok1 then return false, w1 end
+    if not goTo(e, py) then return false, "Could not step to " .. e .. "," .. py .. "." end
+    local ok2, w2 = breakTile(e, yn)
+    if not ok2 then return false, w2 end
+    if not goTo(e, yn) then return false, "Could not step to " .. e .. "," .. yn .. "." end
+  end
+  return false, "Could not walk to row " .. gy .. "."
+end
+
+local rowsDone = 0
+local counted = {}
+
+-- Does all the work of the row gy, always the nearest piece first. Returns true, or false + a reason.
+local function processRow(gy, includeTop)
+  local okM, whyM = moveToRow(gy)
+  if not okM then return false, whyM end
+  while true do
+    local tasks = rowTasks(gy, includeTop, bot:getWorld())   -- one request per round
+    if #tasks == 0 then break end
+    local bx = botTile()
+    local best, bestD
+    for _, t in ipairs(tasks) do
+      local d = math.abs(t.x - bx)
+      if not bestD or d < bestD then best, bestD = t, d end
+    end
+    local t = best
+    if t.kind == "drop" then
+      if not goTo(t.x, t.y) then return false, "Could not walk to the dropped item at " .. t.x .. "," .. t.y .. "." end
+      collectAll(TOP_Y)
+      tried[t.oid] = (tried[t.oid] or 0) + 1       -- always makes progress, even if it cannot be picked up
+    else
+      local dx = t.x - bx
+      if math.abs(dx) > REACH then
+        local xs = t.x - sgn(dx) * REACH            -- every row tile between here and there is already clean
+        if not goTo(xs, gy) then return false, "Could not walk to " .. xs .. "," .. gy .. "." end
+      end
+      local ok, why = breakTile(t.x, t.y, t.kind == "lava")
+      if not ok then return false, why end
+      if t.kind == "lava" then
+        lavaBroken = lavaBroken + 1
+        collectAll(TOP_Y)                            -- take whatever the lava dropped
+        lavaQueue[#lavaQueue + 1] = { x = t.x, y = t.y, gy = gy, tries = 0 }
+        print("Lava at " .. t.x .. "," .. t.y .. " broken, the hole will be filled with Dirt")
+      end
+    end
+    local okS, whyS = service()
+    if not okS then return false, whyS end
+  end
+  if not counted[gy] then
+    counted[gy] = true
+    rowsDone = rowsDone + 1
+    print("Row y=" .. gy .. " is clean (" .. rowsDone .. "), dirt " .. getInventory():findItem(DIRT_ID)
+      .. ", seeds " .. getInventory():findItem(SEED_ID) .. ", pickup requests " .. collected
+      .. ", lava broken " .. lavaBroken .. " / filled " .. lavaFilled)
+  end
+  return true
+end
+
+-- Works through all rows that still have work, nearest row first. Returns true, or false + a reason.
+local function workRows(includeTop)
+  while true do
+    local gy = pickNextRow(includeTop)
+    if not gy then return true end
+    local ok, why = runRetry(function() return processRow(gy, includeTop) end)
+    if not ok then return false, why end
+  end
+end
+
+-- ===== Whole-world audit: reads every tile and drop from one snapshot, no walking =====
+-- includeTop = false: only the dirt layer (the top is not built yet). true: the whole world.
+-- Returns: tiles not clean, lava, holes in platform rows, drops underground, drops on the surface (informational).
+local function scanWorld(includeTop)
+  local w = bot:getWorld()
+  local first = includeTop and BUILD_MIN_Y or TOP_Y
+  local tiles, lava, holes, objs, surf = 0, 0, 0, 0, 0
+  for y = first, LAST_Y do
+    local kind = rowKind(y)
+    for x = 0, WORLD_W - 1 do
+      local t = w:getTile(x, y)
+      if t then
+        local fg, bg = t.fg, t.bg
+        if FILL_LAVA and fg == LAVA_ID then lava = lava + 1 end
+        if kind == "gap" then
+          if (fg ~= 0 and fg ~= 6) or (CLEAR_BG and bg ~= 0) then tiles = tiles + 1 end
+        elseif kind == "platform" then
+          if x == 0 or x == WORLD_W - 1 then
+            if fg ~= 0 or (CLEAR_BG and bg ~= 0) then tiles = tiles + 1 end   -- both ends must be open
+          elseif x >= X_FROM and x <= X_TO and fg == 0 then
+            holes = holes + 1                                                 -- must be solid in between
+          end
+        end
+      end
+    end
+  end
+  for _, o in ipairs(w:getObjects()) do
+    if math.floor(o.y / 32) >= TOP_Y then objs = objs + 1 else surf = surf + 1 end
+  end
+  return tiles, lava, holes, objs, surf
+end
+
+-- Queues the holes of the dirt-layer platform rows for filling (top rows are refilled by buildTop).
+local function queueHoles()
+  local w = bot:getWorld()
+  local known = {}
+  for _, e in ipairs(lavaQueue) do known[e.x .. "," .. e.y] = true; e.tries = 0 end
+  for y = TOP_Y, LAST_Y - 1, 2 do
+    for x = X_FROM, X_TO do
+      local t = w:getTile(x, y)
+      if t and t.fg == 0 and not known[x .. "," .. y] then
+        lavaQueue[#lavaQueue + 1] = { x = x, y = y, gy = y + 1, tries = 0 }
+      end
+    end
+  end
+end
+
+-- ===== Build the top: Dirt from the backpack and depot; seeds are grown WHILE building =====
+-- Returns nil when finished, or the reason it had to stop.
+local function buildTop()
+  softFails, breakRetries = 0, 0
+  local reason
+  -- returns true when the loop may go on; sets reason and returns false for a real failure
+  local function handle(why)
+    if isSoft(why) then
+      if retryLater(why) then return true end
+      reason = "Too many connection/walking problems in a row: " .. tostring(why)
+      return false
+    end
+    reason = why
+    return false
+  end
+
+  while buildRemaining() and not reason do
+    -- 1. trees ready: harvest at once
+    if treesReady() then
+      local ok, why = harvestTrees()
+      if not ok and not handle(why) then break end
+    end
+
+    -- 2. fetch Dirt from the depot
+    if getInventory():findItem(DIRT_ID) < DIRT_BATCH then
+      local ok, why = gatherDepot()
+      if not ok and not handle(why) then break end
+    end
+
+    -- 3. not enough Dirt for the whole top? plant seeds (building goes on while they grow)
+    if not farm.active then
+      local have = getInventory():findItem(DIRT_ID) + depotDirt()
+      local need = neededDirt()
+      if have < need or have == 0 then
+        print("Dirt " .. have .. " < needed " .. need .. ", planting seeds")
+        if farmRounds >= MAX_FARM_ROUNDS then
+          reason = "Reached MAX_FARM_ROUNDS and the top part is still unfinished."
+          break
+        end
+        local ok, why = plantSeeds()
+        if not ok then
+          if isSoft(why) then
+            if not handle(why) then break end
+          elseif getInventory():findItem(DIRT_ID) <= 0 then
+            reason = why
+            break
+          end                                     -- some Dirt left: build with it first
+        end
+      end
+    end
+
+    -- 4. build with what we have; stop early when the trees are ready
+    local okB, whyB = buildSome(treesReady)
+    if not okB then
+      if not handle(whyB) then break end
+    elseif buildRemaining() and getInventory():findItem(DIRT_ID) <= 0 and #depotObjects() == 0 then
+      -- out of Dirt: wait for the trees (the clock counts the waiting time exactly)
+      if farm.active then
+        local waited = 0
+        while farm.active and not treesReady() do
+          sleep(1000)
+          farm.estMs = farm.estMs + 1000
+          guard()
+          waited = waited + 1
+          if waited % 15 == 0 then
+            print("Waiting for the trees: about " .. math.max(0, math.ceil((growMs() - farm.estMs) / 1000)) .. "s left")
+          end
+        end
+      end
+    else
+      softFails = 0
+    end
+  end
+  return reason
+end
+
+-- One repair pass over the whole checked area. Returns nil, or the reason it had to stop.
+local function fixPass(includeTop)
+  if includeTop then bi = 0 end                  -- have buildTop look at every top row again
+  queueHoles()
+  local okW, whyW = workRows(includeTop)         -- nearest work first
+  if not okW then return whyW end
+  local okF, whyF = runRetry(function() return service() end)   -- pick up drops, fill holes, empty the backpack
+  if not okF then return whyF end
+  if includeTop then
+    local why = buildTop()                       -- refill holes in the top rows
+    if why then return why end
+  end
+  return nil
+end
+
+-- Checks the area and repairs it until nothing is left. Returns true when clean, false when not (and the
+-- reason when it had to stop).
+local function verifyLoop(includeTop, label)
+  for pass = 1, MAX_VERIFY_PASSES do
+    tried = {}
+    local tiles, lava, holes, objs, surf = scanWorld(includeTop)
+    print(label .. " check " .. pass .. ": " .. tiles .. " tile(s) not clean, " .. lava .. " lava, " .. holes
+      .. " hole(s) in platform rows, " .. objs .. " drop(s) underground (" .. surf .. " on the surface)")
+    if tiles + lava + holes + objs == 0 then
+      print(label .. " is clean.")
+      return true
+    end
+    local err = fixPass(includeTop)
+    if err then return false, err end
+  end
+  local tiles, lava, holes, objs = scanWorld(includeTop)
+  print(label .. " is still not perfectly clean after " .. MAX_VERIFY_PASSES .. " passes: " .. tiles .. " tile(s), "
+    .. lava .. " lava, " .. holes .. " hole(s), " .. objs .. " drop(s).")
+  return false
+end
+
+-- Optional last step: pick up what lies on the surface (the depot).
+local function takeSurfaceDrops()
+  tried = {}
+  for round = 1, 100 do
+    if backpackFull() then print("Backpack is full, leaving the rest on the surface.") return end
+    local best, bestD
+    local me = getLocal()
+    for _, o in ipairs(getObjects()) do
+      if math.floor(o.y / 32) < TOP_Y and (tried[o.oid] or 0) < MAX_TRIES then
+        local dx, dy = o.x - me.posx, o.y - me.posy
+        local dd = dx * dx + dy * dy
+        if not bestD or dd < bestD then best, bestD = o, dd end
+      end
+    end
+    if not best then return end
+    goTo(math.floor(best.x / 32), math.floor(best.y / 32))
+    collectAll(0)
+    tried[best.oid] = (tried[best.oid] or 0) + 1
+  end
+end
+
+-- ===== STEP 1: scan and clean the dirt layer, nearest work first =====
+local stop
+do
+  local tiles, lava, holes, objs, surf = scanWorld(false)
+  print("Scan of the dirt layer: " .. tiles .. " tile(s) not clean, " .. lava .. " lava, " .. holes
+    .. " hole(s), " .. objs .. " drop(s) underground. Starting with the nearest work.")
+  local okW, whyW = workRows(false)
+  if not okW then stop = whyW end
+end
+
+-- ===== STEP 2: check the dirt layer before going up =====
+if not stop then
+  print("Cleaning done. Checking the dirt layer before going up...")
+  local _, err = verifyLoop(false, "The dirt layer")
+  if err then stop = err end
+end
+
+-- ===== STEP 3: build the top (plant seeds while building when Dirt is short) =====
+if not stop then
+  stop = buildTop()
+end
+
+-- ===== STEP 4: check the WHOLE world at once and repair whatever is left =====
+if not stop then
+  print("Top part built. Checking the whole world...")
+  local clean, err = verifyLoop(true, "The whole world")
+  if err then stop = err end
+  if not stop and FINAL_TAKE_SURFACE_DROPS then takeSurfaceDrops() end
+end
+
+if stop then
+  print("STOPPED, NOT FINISHED: " .. stop)
+else
+  print("Done: the whole world is built and checked.")
+end
+print("Rows cleaned: " .. rowsDone .. ", lava broken " .. lavaBroken .. " / filled with dirt " .. lavaFilled
+  .. ", dirt placed on top: " .. placedDirt .. ", pickup requests " .. collected .. ", drop trips " .. trips
+  .. ", farming rounds " .. farmRounds .. ", reconnects handled " .. recoveries)

@@ -1,0 +1,333 @@
+-- Auto PnB with ONE item: place, break and collect ITEM_ID (numeric ID only).
+-- PnB on the 3 tiles above the bot. Only ITEM_ID is picked up (gems and others are never collected).
+-- If none is in range, the bot shifts just far enough that one enters the radius, collects, and keeps PnB there.
+-- If an ITEM_ID block is in the 3 target tiles at the new spot, it goes back to the previous PnB spot;
+-- otherwise the new spot becomes the PnB spot.
+-- A block that will not break is skipped and retried next pass; the script stops only after MAX_FAILS in a row.
+-- Pickaxe REQUIRED. No extra waits: the only delay is the bot's own place_delay. No file functions.
+-- ===== Settings =====
+local ITEM_ID        = 4584   -- place, break and collect this item (change this to PnB another block)
+local TARGETS        = { {-1, -2}, {0, -2}, {1, -2} }   -- {dx, dy} from the bot's tile, dy < 0 = UP (reach 4)
+local MAX_PUNCH      = 30     -- safety limit of punches per block
+local MAX_FAILS      = 5      -- stop only after this many break failures in a row
+local LAG_HITS       = 2      -- extra hits on a just-placed tile that still looks empty (server lag)
+local PLACE_DELAY_MS = 100    -- the bot's own delay after each place/hit
+local COLLECT_TILES  = 5      -- pickup radius in tiles
+local SHIFT_MARGIN   = 1      -- stop this many tiles inside the radius
+local MAX_WANDER     = 30     -- never go further than this many tiles from the current PnB spot
+local MAX_TRIPS      = 3      -- max shifts per cycle
+local MAX_TRIES      = 2      -- give up on an object after this many pickup attempts
+local PICKAXE_ID     = 98
+local PICKAXE_MSG    = "Enhanced Digging"
+
+-- ===== Setup =====
+local bot = getBot()
+bot:setAutoCollect(false)     -- built-in auto-collect cannot filter by item
+bot.place_delay = PLACE_DELAY_MS
+
+local info = getInfo(ITEM_ID)
+if not info then
+  print("Item ID " .. tostring(ITEM_ID) .. " does not exist, stopping.")
+  return
+end
+print("Item: " .. info.name .. " (" .. ITEM_ID .. ") | place, break, collect within " .. COLLECT_TILES .. " tiles")
+
+if getInventory():findItem(PICKAXE_ID) == 0 then
+  print("No pickaxe (item " .. PICKAXE_ID .. ") in inventory, stopping.")
+  return
+end
+
+-- ===== Pickaxe =====
+local pickaxeOn = false
+addEvent(Event.variantlist, function(vl, net_id)
+  if vl:get(0):getString() == "OnConsoleMessage" then
+    local msg = vl:get(1):getString()
+    if msg:find(PICKAXE_MSG, 1, true) then
+      if msg:find("removed", 1, true) then pickaxeOn = false
+      elseif msg:find("added", 1, true) then pickaxeOn = true end
+    end
+  end
+end)
+
+local function tick() listenEvents(0.02) end
+
+local function ensurePickaxe()
+  tick()
+  if pickaxeOn then return true end
+  for attempt = 1, 2 do
+    bot:wear(PICKAXE_ID)
+    for i = 1, 20 do
+      listenEvents(0.25)
+      if pickaxeOn then break end
+    end
+    if pickaxeOn then print("Pickaxe active") return true end
+    print("No pickaxe confirmation (attempt " .. attempt .. "/2)")
+  end
+  return false
+end
+
+if not ensurePickaxe() then
+  print("Could not confirm the pickaxe is equipped, stopping. PnB needs the pickaxe.")
+  return
+end
+
+-- ===== Helpers =====
+local function botTile()
+  local me = getLocal()
+  return math.floor(me.posx / 32), math.floor(me.posy / 32)
+end
+
+local function tileFg(tx, ty)
+  if tx < 0 or ty < 0 then return nil end
+  local t = getTile(tx, ty)
+  return t and t.fg or nil
+end
+
+local function itemName(id)
+  local i = getInfo(id)
+  return i and i.name or tostring(id)
+end
+
+-- A spot is accepted when NONE of its 3 target tiles holds ITEM_ID (tiles outside the map are unusable).
+local function targetsUsable(x, y)
+  for _, t in ipairs(TARGETS) do
+    local fg = tileFg(x + t[1], y + t[2])
+    if fg == nil or fg == ITEM_ID then return false end
+  end
+  return true
+end
+
+local tried = {}   -- object id -> pickup attempts
+local function itemObjects()
+  local list = {}
+  for _, o in ipairs(getObjects()) do
+    if o.id == ITEM_ID and (tried[o.oid] or 0) < MAX_TRIES then
+      list[#list + 1] = o
+    end
+  end
+  return list
+end
+
+local function distPx(o, me)
+  local dx, dy = o.x - me.posx, o.y - me.posy
+  return math.sqrt(dx * dx + dy * dy)
+end
+
+-- Requests pickup of every ITEM_ID object within the radius. Returns the number of requests.
+local function collectInRange()
+  if not getInventory():canCollect(ITEM_ID) then return 0 end
+  local me, n = getLocal(), 0
+  for _, o in ipairs(itemObjects()) do
+    if distPx(o, me) <= COLLECT_TILES * 32 then
+      tried[o.oid] = (tried[o.oid] or 0) + 1
+      bot:collectObject(o.oid, COLLECT_TILES)   -- the range argument is in TILES
+      n = n + 1
+      tick()
+    end
+  end
+  return n
+end
+
+-- Walks to (x, y); true if the bot ended up within 1 tile of it.
+local function goTo(x, y)
+  bot:findPath(x, y)   -- blocks until arrival
+  tick()
+  local bx, by = botTile()
+  return math.abs(bx - x) <= 1 and math.abs(by - y) <= 1
+end
+
+-- Returns: collected count, PnB spot x, PnB spot y, error text (nil when fine).
+local function collectRound(hx, hy)
+  local got = collectInRange()
+  if got > 0 or not getInventory():canCollect(ITEM_ID) then return got, hx, hy end
+
+  local trips = 0
+  while trips < MAX_TRIPS do
+    local me = getLocal()
+    local best, bestD
+    for _, o in ipairs(itemObjects()) do
+      local ox, oy = math.floor(o.x / 32), math.floor(o.y / 32)
+      if math.abs(ox - hx) <= MAX_WANDER and math.abs(oy - hy) <= MAX_WANDER then
+        local d = distPx(o, me)
+        if not bestD or d < bestD then best, bestD = o, d end
+      end
+    end
+    if not best then break end
+    trips = trips + 1
+
+    -- shift only far enough that the object is (COLLECT_TILES - SHIFT_MARGIN) tiles away
+    local bx, by = botTile()
+    local ox, oy = math.floor(best.x / 32), math.floor(best.y / 32)
+    local dx, dy = ox - bx, oy - by
+    local dist = math.sqrt(dx * dx + dy * dy)
+    local keep = COLLECT_TILES - SHIFT_MARGIN
+    local destX, destY = ox, oy
+    if dist > keep and dist > 0 then
+      destX = math.floor(ox - dx / dist * keep + 0.5)
+      destY = math.floor(oy - dy / dist * keep + 0.5)
+    end
+    if not goTo(destX, destY) and (destX ~= ox or destY ~= oy) then
+      goTo(ox, oy)   -- the shortened spot was not walkable: go to the item itself
+    end
+
+    local n = collectInRange()
+    if n == 0 then tried[best.oid] = (tried[best.oid] or 0) + 1 end
+    got = got + n
+
+    -- ITEM_ID block in the 3 tiles at the new spot -> back to the previous spot; otherwise it is the new spot
+    local nx, ny = botTile()
+    if targetsUsable(nx, ny) then
+      hx, hy = nx, ny
+    else
+      print("ITEM_ID block found in the target tiles at " .. nx .. "," .. ny .. ", returning to " .. hx .. "," .. hy)
+      if not goTo(hx, hy) then return got, hx, hy, "Could not walk back to the PnB spot " .. hx .. "," .. hy end
+      break
+    end
+  end
+
+  -- the final position must be a usable PnB spot
+  local bx, by = botTile()
+  if not targetsUsable(bx, by) then
+    if not goTo(hx, hy) then return got, hx, hy, "Could not walk back to the PnB spot " .. hx .. "," .. hy end
+  else
+    hx, hy = bx, by
+  end
+  return got, hx, hy
+end
+
+-- Hits until the block on (tx, ty) is gone.
+local function breakBlock(t, tx, ty)
+  local fg = tileFg(tx, ty)
+  local punches = 0
+  while fg and fg ~= 0 and punches < MAX_PUNCH do
+    if not pickaxeOn and not ensurePickaxe() then
+      return false, "Pickaxe ran out and could not be re-applied, stopping."
+    end
+    bot:hit(t[1], t[2])
+    punches = punches + 1
+    tick()
+    fg = tileFg(tx, ty)
+  end
+  if fg and fg ~= 0 then
+    return false, "Could not break tile " .. tx .. "," .. ty .. " (" .. itemName(fg) .. ") after "
+      .. punches .. " hits. Check the [Bubble] messages above."
+  end
+  return true
+end
+
+-- ===== Main loop =====
+local justPlaced, warnedTile = {}, {}
+local placed, broken, collected = 0, 0, 0
+local pass, idlePasses, noEffect, warned, stop = 0, 0, 0, false, nil
+local fails = 0
+local hx, hy   -- current PnB spot
+
+while not stop do
+  if not bot:isInWorld() then
+    if not warned then print("Waiting to be in a world...") warned = true end
+    sleep(2000)
+  else
+    warned = false
+    if not hx then
+      hx, hy = botTile()
+      print("PnB spot: " .. hx .. "," .. hy)
+    end
+    pass = pass + 1
+    local bx, by = botTile()
+    local brokeNow, placedNow = 0, 0
+
+    -- 1. BREAK tile 1 until gone, then tile 2, then tile 3
+    for i, t in ipairs(TARGETS) do
+      local tx, ty = bx + t[1], by + t[2]
+      local fg = tileFg(tx, ty)
+
+      -- a block placed a moment ago may still look empty: hit a couple of times anyway
+      if fg == 0 and justPlaced[i] then
+        for _ = 1, LAG_HITS do
+          if not pickaxeOn and not ensurePickaxe() then
+            stop = "Pickaxe ran out and could not be re-applied, stopping."
+            break
+          end
+          bot:hit(t[1], t[2])
+          tick()
+          fg = tileFg(tx, ty)
+          if fg ~= 0 then break end
+        end
+        if stop then break end
+      end
+      justPlaced[i] = nil
+
+      if fg == ITEM_ID then
+        local ok, reason = breakBlock(t, tx, ty)
+        if not ok then
+          if reason:find("Pickaxe", 1, true) then stop = reason break end   -- no pickaxe: really stop
+          fails = fails + 1
+          print(reason .. " (" .. fails .. "/" .. MAX_FAILS .. ", skipping, will retry)")
+          if fails >= MAX_FAILS then
+            stop = "Blocks keep failing to break (" .. fails .. " in a row), stopping."
+            break
+          end
+        else
+          fails = 0
+          broken = broken + 1
+          brokeNow = brokeNow + 1
+        end
+      elseif fg ~= nil and fg ~= 0 and not warnedTile[i] then
+        print("Tile " .. tx .. "," .. ty .. " holds " .. itemName(fg) .. ", not ours, skipping")
+        warnedTile[i] = true
+      end
+    end
+
+    if not stop then
+      -- 2. COLLECT ITEM_ID only; shift just far enough if none is in range
+      local got, nx, ny, err = collectRound(hx, hy)
+      collected = collected + got
+      if nx ~= hx or ny ~= hy then
+        print("New PnB spot: " .. nx .. "," .. ny)
+        justPlaced, warnedTile = {}, {}
+      end
+      hx, hy = nx, ny
+      if err then stop = err end
+    end
+
+    if not stop then
+      -- 3. PLACE on all empty target tiles, back to back
+      bx, by = botTile()
+      local have = getInventory():findItem(ITEM_ID)
+      for i, t in ipairs(TARGETS) do
+        if have <= 0 then break end
+        if tileFg(bx + t[1], by + t[2]) == 0 then
+          bot:place(t[1], t[2], ITEM_ID)
+          have = have - 1
+          justPlaced[i] = true
+          placed = placed + 1
+          placedNow = placedNow + 1
+          tick()
+        end
+      end
+
+      if brokeNow == 0 and placedNow == 0 then
+        idlePasses = idlePasses + 1
+        sleep(100)
+        if idlePasses >= 5 then
+          stop = "Nothing to do: out of item " .. ITEM_ID .. " or no usable target tile, stopping."
+        end
+      else
+        idlePasses = 0
+      end
+      if placedNow > 0 and brokeNow == 0 then
+        noEffect = noEffect + 1
+        if noEffect >= 5 then
+          stop = "Placed blocks never appear. No access here or the server rejects them. Check [Bubble] messages."
+        end
+      else
+        noEffect = 0
+      end
+      if pass % 25 == 0 then
+        print("Placed " .. placed .. ", broken " .. broken .. ", pickup requests " .. collected)
+      end
+    end
+  end
+end
+print(stop)
+print("Done: placed " .. placed .. ", broken " .. broken .. ", pickup requests " .. collected)
