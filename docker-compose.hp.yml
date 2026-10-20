@@ -1,0 +1,12 @@
+services:
+  mori:
+    image: ghcr.io/lunarstoic/mod-gt:latest
+    platform: linux/arm64
+    ports:
+      - "3000:3000"
+    volumes:
+      - mori-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  mori-data:
