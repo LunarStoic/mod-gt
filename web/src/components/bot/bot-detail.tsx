@@ -61,6 +61,7 @@ export function BotDetail({ bot }: { bot: LiveBot }) {
   const setBots = useSetAtom(botsAtom)
   const [tab, setTab] = useState<TabId>(loadTab)
   const [confirmRemove, setConfirmRemove] = useState(false)
+  const [loaded, setLoaded] = useState(false)
 
   useEffect(() => {
     try {
@@ -77,6 +78,7 @@ export function BotDetail({ bot }: { bot: LiveBot }) {
       .getBotState(bot.id)
       .then((s) => {
         if (cancelled) return
+        setLoaded(true)
         setBots((m) => {
           const existing = m.get(bot.id)
           if (!existing) return m
@@ -107,11 +109,14 @@ export function BotDetail({ bot }: { bot: LiveBot }) {
             collect_radius_tiles: s.collect_radius_tiles,
             collect_blacklist: s.collect_blacklist,
             auto_reconnect: s.auto_reconnect,
+            script: s.script ?? '',
           })
         })
       })
       .catch(() => {
-        if (!cancelled) toast.error('Could not load bot details', 'Live updates will still arrive.')
+        if (cancelled) return
+        setLoaded(true)
+        toast.error('Could not load bot details', 'Live updates will still arrive.')
       })
     return () => {
       cancelled = true
@@ -286,7 +291,7 @@ export function BotDetail({ bot }: { bot: LiveBot }) {
           <ConsoleTab lines={bot.console} />
         </TabsContent>
         <TabsContent value="script" className="min-h-0">
-          <ScriptTab bot={bot} />
+          <ScriptTab key={loaded ? 'ready' : 'loading'} bot={bot} loaded={loaded} />
         </TabsContent>
         <TabsContent value="settings" className="min-h-0 overflow-y-auto">
           <SettingsTab bot={bot} />

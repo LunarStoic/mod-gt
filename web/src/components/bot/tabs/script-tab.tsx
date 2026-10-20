@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSetAtom } from 'jotai'
 import { Download, FileUp, Play, Square } from 'lucide-react'
-import type { LiveBot } from '@/lib/store'
+import { botsAtom, type LiveBot } from '@/lib/store'
+import { api } from '@/lib/api'
 import { toast } from '@/lib/toast'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -38,8 +40,12 @@ function loadDraft(id: number): string {
   }
 }
 
-export function ScriptTab({ bot }: { bot: LiveBot }) {
-  const [script, setScript] = useState(() => loadDraft(bot.id))
+export function ScriptTab({ bot, loaded }: { bot: LiveBot; loaded: boolean }) {
+  const setBots = useSetAtom(botsAtom)
+  // The script saved with the bot wins; the browser draft is the fallback.
+  const [script, setScript] = useState(() => bot.script || loadDraft(bot.id))
+  const savedRef = useRef(bot.script)
+  const [saveState, setSaveState] = useState<'saved' | 'saving' | 'failed'>('saved')
   const [busy, setBusy] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
@@ -55,6 +61,34 @@ export function ScriptTab({ bot }: { bot: LiveBot }) {
     return () => window.clearTimeout(t)
   }, [bot.id, script])
 
+  // Saves the script with the bot (kept across restarts for Google/Token bots).
+  const saveToBot = useCallback(
+    async (text: string) => {
+      if (text === savedRef.current) return true
+      setSaveState('saving')
+      try {
+        await api.sendCmd(bot.id, { type: 'save_script', content: text })
+        savedRef.current = text
+        setBots((m) => {
+          const b = m.get(bot.id)
+          return b ? new Map(m).set(bot.id, { ...b, script: text }) : m
+        })
+        setSaveState('saved')
+        return true
+      } catch {
+        setSaveState('failed')
+        return false
+      }
+    },
+    [bot.id, setBots],
+  )
+
+  useEffect(() => {
+    if (!loaded || script === savedRef.current) return
+    const t = window.setTimeout(() => void saveToBot(script), 1200)
+    return () => window.clearTimeout(t)
+  }, [loaded, script, saveToBot])
+
   const state = useMemo(() => scriptState(bot.console), [bot.console])
   const running = state === 'running'
   const lines = script ? script.split('\n').length : 0
@@ -65,6 +99,7 @@ export function ScriptTab({ bot }: { bot: LiveBot }) {
       return
     }
     setBusy(true)
+    await saveToBot(script)
     await runCmd(bot.id, { type: 'run_script', content: script }, { success: 'Script started', error: 'Could not start the script' })
     setBusy(false)
   }
@@ -158,6 +193,7 @@ export function ScriptTab({ bot }: { bot: LiveBot }) {
         value={script}
         onChange={(e) => setScript(e.target.value)}
         onKeyDown={onKeyDown}
+        disabled={!loaded}
         spellCheck={false}
         autoCapitalize="off"
         autoCorrect="off"
@@ -167,8 +203,15 @@ export function ScriptTab({ bot }: { bot: LiveBot }) {
       />
 
       <p className="shrink-0 text-xs text-muted-foreground">
-        <span className="tabular">{lines.toLocaleString()}</span> lines · drafts are kept in this
-        browser · <kbd className="rounded border border-border bg-muted px-1 font-sans">Ctrl</kbd>
+        <span className="tabular">{lines.toLocaleString()}</span> lines ·{' '}
+        <span className={saveState === 'failed' ? 'text-destructive' : undefined}>
+          {saveState === 'saving'
+            ? 'saving…'
+            : saveState === 'failed'
+              ? 'could not save to the bot'
+              : 'saved with this bot'}
+        </span>{' '}
+        · <kbd className="rounded border border-border bg-muted px-1 font-sans">Ctrl</kbd>
         {' + '}
         <kbd className="rounded border border-border bg-muted px-1 font-sans">Enter</kbd> to run ·
         script output appears in the Console tab

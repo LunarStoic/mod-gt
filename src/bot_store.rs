@@ -31,6 +31,9 @@ pub struct SavedSettings {
     pub collect_radius_tiles: u8,
     pub collect_blacklist: Vec<u16>,
     pub delays: BotDelays,
+    /// Script saved from the dashboard; absent in files written by older versions.
+    #[serde(default)]
+    pub script: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

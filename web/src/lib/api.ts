@@ -132,6 +132,8 @@ export interface BotState {
   collect_radius_tiles: number;
   collect_blacklist: number[];
   auto_reconnect: boolean;
+  /** Script saved with the bot on the server (empty when none). */
+  script?: string;
 }
 
 export interface SpawnBotBody {
@@ -185,6 +187,7 @@ export type BotCmd =
   }
   | { type: "set_auto_collect"; enabled: boolean }
   | { type: "set_auto_reconnect"; enabled: boolean }
+  | { type: "save_script"; content: string }
   | { type: "disconnect" }
   | { type: "reconnect" }
   | { type: "set_collect_config"; radius_tiles: number; blacklist: number[] }

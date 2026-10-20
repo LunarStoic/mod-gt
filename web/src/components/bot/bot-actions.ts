@@ -18,7 +18,15 @@ export async function runCmd(
     if (opts.success) toast.success(opts.success)
     return true
   } catch (e) {
-    toast.error(opts.error ?? 'Command failed', errMessage(e))
+    const msg = errMessage(e)
+    // 404 means the backend no longer has a running bot with this id (e.g. its thread ended
+    // or the list on screen is from before a restart).
+    toast.error(
+      opts.error ?? 'Command failed',
+      msg.includes('404')
+        ? 'The backend has no running bot with this ID. Reload the page; if the bot is still listed, remove it and add it again.'
+        : msg,
+    )
     return false
   }
 }

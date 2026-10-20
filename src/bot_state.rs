@@ -144,6 +144,8 @@ pub struct BotState {
     pub collect_blacklist: Vec<u16>,
     /// Skip gems (item ID 112) during auto-collect when true.
     pub ignore_gems: bool,
+    /// Script text saved with the bot from the dashboard (restored after a restart).
+    pub script: String,
     /// Skip essences (item IDs 5024/5026/5028/5030) during auto-collect when true.
     pub ignore_essences: bool,
     /// Leave world automatically when a mod is detected via OnSpawn.
@@ -181,6 +183,7 @@ impl Default for BotState {
             collect_radius_tiles: 3,
             collect_blacklist: Vec::new(),
             ignore_gems: false,
+            script: String::new(),
             ignore_essences: false,
             auto_leave_on_mod: false,
             auto_ban: false,
@@ -216,6 +219,7 @@ pub enum BotCommand {
         blacklist: Vec<u16>,
     },
     SetAutoReconnect { enabled: bool },
+    SaveScript { content: String },
     AcceptAccess,
 }
 

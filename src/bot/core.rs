@@ -568,6 +568,7 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
                     collect_radius_tiles: self.collect_radius_tiles,
                     collect_blacklist: sorted_blacklist_vec(&self.collect_blacklist),
                     delays: self.delays.clone(),
+                    script: self.state.read().unwrap().script.clone(),
                 },
             );
         }
@@ -586,6 +587,7 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
         st.collect_radius_tiles = self.collect_radius_tiles;
         st.collect_blacklist = sorted_blacklist_vec(&self.collect_blacklist);
         st.delays = self.delays.clone();
+        st.script = saved.script.clone();
     }
 
     /// Writes the current `token|rid|mac|wk` to the bot store (no-op for unsaved bots).
@@ -617,7 +619,9 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
         }
         self.host = Self::create_host(self.proxy.as_ref());
         self.log_console("[Status] Getting server address...".to_string());
-        self.refresh_token();
+        if !self.refresh_token() {
+            return;
+        }
 
         let login_info = LoginInfo {
             protocol: PROTOCOL,
@@ -764,7 +768,8 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
     }
 
     /// Refreshes `self.ltoken`: tries check_token first, then falls back based on login method.
-    fn refresh_token(&mut self) {
+    /// Returns false when an ltoken bot could not refresh its login (it then stays Stopped).
+    fn refresh_token(&mut self) -> bool {
         let login_data = self.build_login_data();
         let proxy = self.proxy.as_ref().map(|p| p.to_url());
         let proxy_url = proxy.as_deref();
@@ -783,7 +788,7 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                         self.log_console("[Bot] Token refreshed via check_token".to_string());
                         self.ltoken = new_token;
                         self.persist_token();
-                        return;
+                        return true;
                     }
                     Err(e) => {
                         self.log_console(format!(
@@ -799,10 +804,20 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
 
         match &self.login_method {
             LoginMethod::Ltoken => {
+                // Keep the bot alive (status Stopped) so the dashboard can still reach it:
+                // ending the thread would make every later command fail with 404.
                 self.log_console(
-                    "[Bot] ltoken login — no fallback credentials, stopping bot".to_string(),
+                    "[Bot] Could not refresh the saved login after several attempts. The token may \
+have expired or the network is blocking the login server. Press Reconnect to try again; if it keeps \
+failing, remove this bot and add it again with Google."
+                        .to_string(),
                 );
-                self.stop_requested = true;
+                self.state.write().unwrap().status = BotStatus::Stopped;
+                self.emit(WsEvent::BotStatus {
+                    bot_id: self.bot_id,
+                    status: "stopped".into(),
+                });
+                return false;
             }
             LoginMethod::Legacy { password } => {
                 let password = password.clone();
@@ -834,6 +849,7 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                 self.meta = creds.meta;
             }
         }
+        true
     }
 
     pub fn run(&mut self, stop_flag: Arc<AtomicBool>) {
@@ -896,6 +912,11 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
 
     /// Process all pending ENet events once.
     pub fn service_once(&mut self) {
+        // A Stopped bot never connected (or gave up): its ENet host has no peer, and servicing
+        // such a host panics inside rusty_enet (Option::unwrap on None).
+        if self.state.read().unwrap().status == BotStatus::Stopped {
+            return;
+        }
         while let Some(event) = self.host.next_event() {
             match event {
                 enet::EventNoRef::Connect { peer: id, .. } => {
@@ -2869,6 +2890,7 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
                 | BotCommand::SetAutoCollect { .. }
                 | BotCommand::SetAutoReconnect { .. }
                 | BotCommand::SetCollectConfig { .. }
+                | BotCommand::SaveScript { .. }
         );
         match cmd {
             BotCommand::Move { x, y } => {
@@ -3004,6 +3026,11 @@ rid|{}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{}\nmac|{}\nwk|{}\nz
             BotCommand::SetAutoReconnect { enabled } => {
                 self.auto_reconnect = enabled;
                 self.state.write().unwrap().auto_reconnect = enabled;
+            }
+            BotCommand::SaveScript { content } => {
+                // Cap the size so a huge paste cannot bloat the bot store file.
+                let content: String = content.chars().take(1_000_000).collect();
+                self.state.write().unwrap().script = content;
             }
             BotCommand::SetCollectConfig {
                 radius_tiles,
