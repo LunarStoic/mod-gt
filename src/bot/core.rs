@@ -375,6 +375,7 @@ impl Bot {
         bot_id: u32,
         ws_tx: Option<WsTx>,
         persist_key: Option<String>,
+        start_paused: bool,
     ) -> Self {
         let (ltoken, rid, mac, wk) = Self::parse_ltoken_string(ltoken_str)
             .expect("[Bot] Invalid ltoken string — expected token|rid|mac|wk");
@@ -409,43 +410,53 @@ impl Bot {
             }
         };
 
-        let mut alternate = false;
-        let server_data = loop {
-            log_fn(format!(
-                "[Status] Getting server address... (alternate={alternate})"
-            ));
-            match get_server_data_proxied(alternate, &login_info, proxy_url_ref) {
-                Ok(s) => break s,
-                Err(e) => {
-                    alternate = !alternate;
-                    log_fn(format!(
-                        "[Bot] fetch: server_data failed: {e} — retrying in 5s"
-                    ));
-                    std::thread::sleep(std::time::Duration::from_secs(5));
+        // A paused bot (saved bot restored at startup) makes no network request until the user
+        // presses Reconnect; `reconnect_main` then refreshes the token and connects.
+        let mut meta = String::new();
+        let mut ltoken = ltoken;
+        let mut addr: Option<SocketAddr> = None;
+        if !start_paused {
+            let mut alternate = false;
+            let server_data = loop {
+                log_fn(format!(
+                    "[Status] Getting server address... (alternate={alternate})"
+                ));
+                match get_server_data_proxied(alternate, &login_info, proxy_url_ref) {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        alternate = !alternate;
+                        log_fn(format!(
+                            "[Bot] fetch: server_data failed: {e} — retrying in 5s"
+                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
                 }
-            }
-        };
+            };
 
-        let klv = compute_klv(GAME_VER, &PROTOCOL.to_string(), &rid, hash);
-        let login_data = format!(
-            "tankIDName|\ntankIDPass|\nrequestedName|\nf|1\nprotocol|{PROTOCOL}\n\
+            let klv = compute_klv(GAME_VER, &PROTOCOL.to_string(), &rid, hash);
+            let login_data = format!(
+                "tankIDName|\ntankIDPass|\nrequestedName|\nf|1\nprotocol|{PROTOCOL}\n\
 game_version|{GAME_VER}\nfz|22243512\ncbits|1024\nplayer_age|20\nGDPR|2\nFCMToken|\n\
 category|_-5100\ntotalPlaytime|0\nklv|{klv}\nhash2|{hash2}\nmeta|{}\nfhash|{FHASH}\n\
 rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}\nwk|{wk}\nzf|31631978\nlmode|1\n",
-            server_data.meta,
-        );
+                server_data.meta,
+            );
 
-        let ltoken = match check_token(&ltoken, &login_data, proxy_url_ref) {
-            Ok(new_token) => {
-                log_fn(format!("[Bot] ltoken validated successfully"));
-                new_token
-            }
-            Err(e) => panic!("[Bot] ltoken validation failed: {e} — stopping"),
-        };
+            ltoken = match check_token(&ltoken, &login_data, proxy_url_ref) {
+                Ok(new_token) => {
+                    log_fn(format!("[Bot] ltoken validated successfully"));
+                    new_token
+                }
+                Err(e) => panic!("[Bot] ltoken validation failed: {e} — stopping"),
+            };
 
-        let addr: SocketAddr = format!("{}:{}", server_data.server, server_data.port)
-            .parse()
-            .expect("Invalid server address");
+            meta = server_data.meta.clone();
+            addr = Some(
+                format!("{}:{}", server_data.server, server_data.port)
+                    .parse()
+                    .expect("Invalid server address"),
+            );
+        }
 
         let host = Self::create_host(proxy.as_ref());
         let mut bot = Bot {
@@ -454,7 +465,7 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
             username: String::new(),
             login_method: LoginMethod::Ltoken,
             ltoken,
-            meta: server_data.meta,
+            meta,
             mac,
             hash,
             hash2,
@@ -523,9 +534,27 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
                 bot.apply_saved_settings(&saved);
             }
         }
-        bot.persist_token();
-        bot.connect_to(addr);
+        match addr {
+            Some(addr) => {
+                bot.persist_token();
+                bot.connect_to(addr);
+            }
+            None => bot.set_stopped(),
+        }
         bot
+    }
+
+    /// Marks a restored bot as waiting for a manual Reconnect (nothing is sent to the network).
+    fn set_stopped(&self) {
+        self.state.write().unwrap().status = BotStatus::Stopped;
+        self.emit(WsEvent::BotStatus {
+            bot_id: self.bot_id,
+            status: "stopped".into(),
+        });
+        self.log_console(
+            "[Status] Saved bot loaded, waiting. Press Reconnect to log in (it refreshes the saved token first)."
+                .to_string(),
+        );
     }
 
     /// Remembers the dashboard settings so they survive a restart (no-op for unsaved bots).
@@ -572,6 +601,20 @@ rid|{rid}\nplatformID|0,1,1\ndeviceVersion|0\ncountry|jp\nhash|{hash}\nmac|{mac}
     fn reconnect_main(&mut self) {
         // Any pending delayed reconnect is superseded by this one.
         self.reconnect_after = None;
+        let was_stopped = {
+            let mut s = self.state.write().unwrap();
+            let stopped = s.status == BotStatus::Stopped;
+            if stopped {
+                s.status = BotStatus::Connecting;
+            }
+            stopped
+        };
+        if was_stopped {
+            self.emit(WsEvent::BotStatus {
+                bot_id: self.bot_id,
+                status: "connecting".into(),
+            });
+        }
         self.host = Self::create_host(self.proxy.as_ref());
         self.log_console("[Status] Getting server address...".to_string());
         self.refresh_token();

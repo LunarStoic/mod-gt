@@ -80,7 +80,7 @@ export function DocsPage() {
   return (
     <div className="flex h-full flex-col overflow-hidden bg-background">
       <div className="shrink-0 border-b border-border bg-card/80 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl flex-col gap-5 px-6 py-6">
+        <div className="mx-auto flex max-w-7xl flex-col gap-5 px-4 py-5 sm:px-6">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
             <div className="space-y-3">
               <div className="flex flex-wrap items-center gap-2">
@@ -92,7 +92,7 @@ export function DocsPage() {
                 <Badge variant="outline">Synced to LUA.md</Badge>
               </div>
               <div className="space-y-2">
-                <h1 className="text-2xl font-semibold tracking-tight text-foreground">
+                <h1 className="text-xl font-semibold tracking-tight text-foreground">
                   Mori scripting reference
                 </h1>
                 <p className="max-w-3xl text-sm leading-6 text-muted-foreground">
@@ -116,7 +116,7 @@ export function DocsPage() {
                 placeholder="Search functions, fields, tables, or examples..."
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                className="h-10 rounded-xl border-border/70 bg-background pl-10 text-sm"
+                className="h-10 rounded-lg bg-background pl-10 text-sm"
               />
             </div>
             {q.trim() ? (
@@ -161,12 +161,12 @@ export function DocsPage() {
         </aside>
 
         <ScrollArea className="h-full min-h-0">
-          <div className="mx-auto flex max-w-5xl flex-col gap-5 px-6 py-6">
+          <div className="mx-auto flex max-w-5xl flex-col gap-5 px-4 py-5 sm:px-6">
             {filtered.map((section) => (
               <section
                 key={section.id}
                 id={section.id}
-                className="overflow-hidden rounded-3xl border border-border/70 bg-card shadow-sm"
+                className="overflow-hidden rounded-xl border border-border/70 bg-card shadow-sm"
               >
                 <div className="border-b border-border/70 bg-gradient-to-r from-muted/70 via-card to-card px-6 py-5">
                   <div className="flex flex-wrap items-start justify-between gap-3">
@@ -184,13 +184,13 @@ export function DocsPage() {
                   </div>
                 </div>
 
-                <div className="space-y-5 p-6">
+                <div className="space-y-5 p-4 sm:p-6">
                   {section.matchedEntries.length > 0 && (
                     <div className="grid gap-3">
                       {section.matchedEntries.map((entry) => (
                         <article
                           key={`${section.id}-${entry.name}-${entry.signature ?? 'entry'}`}
-                          className="rounded-2xl border border-border/70 bg-background/70 p-4"
+                          className="rounded-lg border border-border/70 bg-background/70 p-4"
                         >
                           <div className="space-y-2">
                             <div className="flex flex-wrap items-center gap-2">
@@ -221,8 +221,8 @@ export function DocsPage() {
                   )}
 
                   {section.matchedTables.map((table) => (
-                    <div key={`${section.id}-${table.title}`} className="overflow-hidden rounded-2xl border border-border/70">
-                      <div className="border-b border-border/70 bg-muted/40 px-4 py-3">
+                    <div key={`${section.id}-${table.title}`} className="overflow-hidden rounded-lg border border-border/70">
+                      <div className="border-b border-border/70 bg-muted/40 px-3 py-3 sm:px-4">
                         <h3 className="text-sm font-semibold text-foreground">{table.title}</h3>
                       </div>
                       <Table>
@@ -257,7 +257,7 @@ export function DocsPage() {
                   ))}
 
                   {section.example && (
-                    <div className="overflow-hidden rounded-2xl border border-border/70 bg-zinc-950 text-zinc-50">
+                    <div className="overflow-hidden rounded-lg border border-border/70 bg-zinc-950 text-zinc-50">
                       <div className="border-b border-white/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.22em] text-zinc-400">
                         Example
                       </div>
@@ -271,7 +271,7 @@ export function DocsPage() {
             ))}
 
             {filtered.length === 0 && (
-              <div className="rounded-3xl border border-dashed border-border bg-card/60 px-6 py-16 text-center">
+              <div className="rounded-xl border border-dashed border-border bg-card/60 px-6 py-16 text-center">
                 <p className="text-lg font-medium text-foreground">No docs matched your search.</p>
                 <p className="mt-2 text-sm text-muted-foreground">
                   Try Bot, Tile, HttpClient, Webhook, or a method like collectObject.
@@ -295,7 +295,7 @@ function StatCard({
   icon: typeof BookOpen
 }) {
   return (
-    <div className="rounded-2xl border border-border/70 bg-background/80 px-4 py-3">
+    <div className="rounded-lg border border-border/70 bg-background/80 px-3 py-3 sm:px-4">
       <div className="flex items-center justify-between gap-3">
         <div>
           <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">
@@ -303,7 +303,7 @@ function StatCard({
           </p>
           <p className="mt-1 text-lg font-semibold text-foreground">{value}</p>
         </div>
-        <div className="rounded-xl border border-border/70 bg-card p-2 text-muted-foreground">
+        <div className="hidden rounded-xl border border-border/70 bg-card p-2 text-muted-foreground sm:block">
           <Icon className="size-4" />
         </div>
       </div>

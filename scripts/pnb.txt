@@ -5,6 +5,8 @@
 -- otherwise the new spot becomes the PnB spot.
 -- A block that will not break is skipped and retried next pass; the script stops only after MAX_FAILS in a row.
 -- Pickaxe REQUIRED. No extra waits: the only delay is the bot's own place_delay. No file functions.
+-- This script never drops or trashes anything, so World Lock, Diamond Lock and Blue/Black Gem Lock always stay
+-- in the backpack. (If you ever add a drop to it, skip item ids 242, 1796, 7188 and 11550.)
 -- ===== Settings =====
 local ITEM_ID        = 4584   -- place, break and collect this item (change this to PnB another block)
 local TARGETS        = { {-1, -2}, {0, -2}, {1, -2} }   -- {dx, dy} from the bot's tile, dy < 0 = UP (reach 4)
