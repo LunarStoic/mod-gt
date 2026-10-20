@@ -72,17 +72,42 @@ class EventBus {
 
 // ── MoriWebSocket singleton ────────────────────────────────────────────────
 
+export type WsState = 'connecting' | 'open' | 'closed'
+
 class MoriWebSocket {
   readonly bus = new EventBus()
   private ws: WebSocket | null = null
   private retryTimer: ReturnType<typeof setTimeout> | null = null
   private destroyed = false
+  private _state: WsState = 'closed'
+  private stateListeners = new Set<() => void>()
+
+  get state(): WsState {
+    return this._state
+  }
+
+  subscribeState = (fn: () => void) => {
+    this.stateListeners.add(fn)
+    return () => {
+      this.stateListeners.delete(fn)
+    }
+  }
+
+  private setState(s: WsState) {
+    if (this._state === s) return
+    this._state = s
+    this.stateListeners.forEach((fn) => fn())
+  }
 
   connect(baseUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`) {
     if (this.ws) return
+    this.destroyed = false
     const token = authStore.getToken()
     const url = token ? `${baseUrl}?token=${encodeURIComponent(token)}` : baseUrl
+    this.setState('connecting')
     this.ws = new WebSocket(url)
+
+    this.ws.onopen = () => this.setState('open')
 
     this.ws.onmessage = (e) => {
       try {
@@ -95,6 +120,7 @@ class MoriWebSocket {
 
     this.ws.onclose = () => {
       this.ws = null
+      this.setState('closed')
       if (!this.destroyed) {
         this.retryTimer = setTimeout(() => this.connect(baseUrl), 3000)
       }

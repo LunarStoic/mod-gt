@@ -1,11 +1,11 @@
 import { useState } from 'react'
-import { CheckCircle2, XCircle, Loader2, ShieldCheck } from 'lucide-react'
+import { CheckCircle2, XCircle, Loader2, ShieldCheck, Copy, Eraser, Play } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
-import { api, type ProxyTestResult } from '@/lib/api'
+import { api, type CheckResult, type ProxyTestResult } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { toast } from '@/lib/toast'
+import { Card, EmptyState, PageHeader } from '@/components/common'
 
 interface ParsedProxy {
   host: string
@@ -32,27 +32,33 @@ interface ProxyEntry {
   parseError?: string
 }
 
+const isOk = (e: ProxyEntry) =>
+  !!(e.result?.socks5.ok && e.result?.server_data.ok && e.result?.enet.ok)
+
 export function ProxyPage() {
   const [input, setInput] = useState('')
   const [entries, setEntries] = useState<ProxyEntry[]>([])
   const [running, setRunning] = useState(false)
 
   function updateEntry(i: number, patch: Partial<ProxyEntry>) {
-    setEntries(prev => prev.map((e, j) => (j === i ? { ...e, ...patch } : e)))
+    setEntries((prev) => prev.map((e, j) => (j === i ? { ...e, ...patch } : e)))
   }
 
   async function handleTest() {
-    const lines = input.split('\n').map(l => l.trim()).filter(Boolean)
+    const lines = input
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
     if (!lines.length) return
 
-    setEntries(lines.map(raw => ({ raw, status: 'idle' })))
+    setEntries(lines.map((raw) => ({ raw, status: 'idle' })))
     setRunning(true)
 
     await Promise.allSettled(
       lines.map(async (raw, i) => {
         const parsed = parseProxyLine(raw)
         if (!parsed) {
-          updateEntry(i, { status: 'done', parseError: 'invalid format' })
+          updateEntry(i, { status: 'done', parseError: 'Invalid format, use host:port[:user:pass]' })
           return
         }
         updateEntry(i, { status: 'testing' })
@@ -70,151 +76,188 @@ export function ProxyPage() {
             parseError: err instanceof Error ? err.message : String(err),
           })
         }
-      })
+      }),
     )
 
     setRunning(false)
   }
 
+  async function copyWorking() {
+    const working = entries.filter(isOk).map((e) => e.raw)
+    if (working.length === 0) return
+    try {
+      await navigator.clipboard.writeText(working.join('\n'))
+      toast.success('Copied working proxies', `${working.length} proxy line${working.length === 1 ? '' : 's'}`)
+    } catch {
+      toast.error('Could not copy', 'Clipboard access was blocked by the browser.')
+    }
+  }
+
   const total = entries.length
-  const done = entries.filter(e => e.status === 'done').length
-  const ok = entries.filter(
-    e => e.result?.socks5.ok && e.result?.server_data.ok && e.result?.enet.ok
-  ).length
+  const done = entries.filter((e) => e.status === 'done').length
+  const ok = entries.filter(isOk).length
+  const lineCount = input.split('\n').filter((l) => l.trim()).length
 
   return (
-    <div className="h-full flex flex-col overflow-hidden">
-      <div className="shrink-0 flex items-center gap-2 px-4 py-2.5 border-b border-border bg-card">
-        <ShieldCheck className="w-3.5 h-3.5 text-muted-foreground" />
-        <span className="text-xs font-medium text-foreground">Proxy Tester</span>
-        {total > 0 && (
-          <span className="ml-auto text-xs text-muted-foreground">
-            {done}/{total}&nbsp;tested&nbsp;·&nbsp;
-            <span className="text-green-500">{ok} ok</span>
-            &nbsp;·&nbsp;
-            <span className="text-destructive">{done - ok} failed</span>
-          </span>
-        )}
-      </div>
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto flex max-w-6xl flex-col gap-4 p-4 sm:p-6">
+        <PageHeader
+          icon={ShieldCheck}
+          title="Proxy tester"
+          description="Check that SOCKS5 proxies can log in and play. Bots need SOCKS5 with UDP support."
+          actions={
+            total > 0 && (
+              <div className="tabular flex items-center gap-3 text-sm text-muted-foreground">
+                <span>
+                  {done}/{total} tested
+                </span>
+                <span className="text-success">{ok} working</span>
+                <span className="text-destructive">{done - ok} failed</span>
+              </div>
+            )
+          }
+        />
 
-      <div className="flex-1 flex overflow-hidden">
-        {/* ── Input panel ── */}
-        <div className="w-56 shrink-0 flex flex-col gap-2 p-3 border-r border-border">
-          <label className="text-xs text-muted-foreground leading-tight">
-            One proxy per line
-            <span className="block font-mono text-[10px] mt-0.5 text-muted-foreground/60">
-              host:port:user:pass
-            </span>
-          </label>
-          <Textarea
-            className="flex-1 font-mono text-xs placeholder:text-muted-foreground/50 min-h-0"
-            placeholder={"103.160.95.181:1080:user:pass\n45.32.10.5:1080"}
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            spellCheck={false}
-          />
-          <Button
-            size="sm"
-            className="h-8 text-xs shrink-0"
-            disabled={!input.trim() || running}
-            onClick={handleTest}
+        <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+          <Card title="Proxies" hint="one per line">
+            <div className="flex flex-col gap-3">
+              <Textarea
+                className="min-h-48 resize-y font-mono text-xs"
+                placeholder={'103.160.95.181:1080:user:pass\n45.32.10.5:1080'}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                spellCheck={false}
+                aria-label="Proxy list"
+              />
+              <p className="font-mono text-xs text-muted-foreground">host:port:user:pass</p>
+              <div className="flex gap-2">
+                <Button className="flex-1" disabled={lineCount === 0 || running} onClick={handleTest}>
+                  {running ? <Loader2 className="animate-spin" /> : <Play />}
+                  {running
+                    ? 'Testing…'
+                    : lineCount > 0
+                      ? `Test ${lineCount} prox${lineCount === 1 ? 'y' : 'ies'}`
+                      : 'Test proxies'}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  aria-label="Clear"
+                  title="Clear list and results"
+                  disabled={running || (!input && total === 0)}
+                  onClick={() => {
+                    setInput('')
+                    setEntries([])
+                  }}
+                >
+                  <Eraser />
+                </Button>
+              </div>
+            </div>
+          </Card>
+
+          <Card
+            title="Results"
+            actions={
+              ok > 0 && (
+                <Button variant="outline" size="sm" onClick={copyWorking}>
+                  <Copy />
+                  Copy working
+                </Button>
+              )
+            }
+            bodyClassName="p-0"
           >
-            {running ? (
-              <>
-                <Loader2 className="w-3 h-3 animate-spin mr-1.5" />
-                Testing…
-              </>
+            {entries.length === 0 ? (
+              <EmptyState
+                icon={ShieldCheck}
+                title="No results yet"
+                description="Paste your proxies and press Test. Each one is checked for SOCKS5, server data and the ENet game connection."
+              />
             ) : (
-              'Test All'
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-border text-xs text-muted-foreground">
+                      <th className="h-9 px-4 text-left font-medium">Proxy</th>
+                      <th className="h-9 px-3 text-center font-medium whitespace-nowrap">SOCKS5</th>
+                      <th className="h-9 px-3 text-center font-medium whitespace-nowrap">Server data</th>
+                      <th className="h-9 px-3 text-center font-medium whitespace-nowrap">ENet UDP</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {entries.map((entry, i) => (
+                      <ProxyRow key={i} entry={entry} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
-          </Button>
+          </Card>
         </div>
-
-        {/* ── Results panel ── */}
-        {entries.length === 0 ? (
-          <div className="flex-1 flex items-center justify-center text-xs text-muted-foreground">
-            paste proxies on the left and click Test All
-          </div>
-        ) : (
-          <ScrollArea className="flex-1">
-            <Table className="text-xs">
-              <TableHeader className="sticky top-0 z-10 bg-card">
-                <TableRow>
-                  <TableHead className="w-full">Proxy</TableHead>
-                  <TableHead className="text-center">SOCKS5</TableHead>
-                  <TableHead className="text-center">server_data</TableHead>
-                  <TableHead className="text-center">ENet UDP</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {entries.map((entry, i) => (
-                  <ProxyRow key={i} entry={entry} />
-                ))}
-              </TableBody>
-            </Table>
-          </ScrollArea>
-        )}
       </div>
     </div>
   )
 }
 
-function CheckIcon({
-  check,
-  testing,
-}: {
-  check?: { ok: boolean; error?: string }
-  testing: boolean
-}) {
-  if (testing) return <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground mx-auto" />
-  if (!check) return <span className="block w-2 h-2 rounded-full bg-muted mx-auto" />
+function CheckIcon({ check, testing }: { check?: CheckResult; testing: boolean }) {
+  if (testing) return <Loader2 className="mx-auto size-4 animate-spin text-muted-foreground" />
+  if (!check) return <span className="mx-auto block size-2 rounded-full bg-muted-foreground/30" />
+  const detail = check.error || check.detail
   return check.ok ? (
-    <CheckCircle2 className="w-3.5 h-3.5 text-green-500 mx-auto" />
+    <CheckCircle2 className="mx-auto size-4 text-success" aria-label="Passed">
+      {detail && <title>{detail}</title>}
+    </CheckCircle2>
   ) : (
-    <XCircle className="w-3.5 h-3.5 text-destructive mx-auto" />
+    <XCircle className="mx-auto size-4 text-destructive" aria-label="Failed">
+      {detail && <title>{detail}</title>}
+    </XCircle>
   )
 }
 
 function ProxyRow({ entry }: { entry: ProxyEntry }) {
   const testing = entry.status === 'testing'
+  // never show the password back on screen
   const display = entry.raw.split(':').slice(0, 2).join(':')
-
-  const allOk = entry.result?.socks5.ok && entry.result?.server_data.ok && entry.result?.enet.ok
+  const allOk = isOk(entry)
+  const firstError =
+    entry.parseError ||
+    (entry.result &&
+      (!entry.result.socks5.ok
+        ? entry.result.socks5.error
+        : !entry.result.server_data.ok
+          ? entry.result.server_data.error
+          : !entry.result.enet.ok
+            ? entry.result.enet.error
+            : undefined))
 
   return (
-    <TableRow>
-      <TableCell>
+    <tr className="border-b border-border/60 last:border-0 hover:bg-muted/40">
+      <td className="px-4 py-2.5">
         <span
           className={cn(
             'font-mono',
-            entry.status === 'done' && allOk && 'text-green-500',
-            entry.status === 'done' && !allOk && 'text-foreground',
+            entry.status === 'done' && allOk && 'text-success',
             entry.status !== 'done' && 'text-muted-foreground',
           )}
         >
           {display}
         </span>
-        {entry.status === 'idle' && (
-          <span className="ml-2 text-muted-foreground/60">waiting…</span>
-        )}
-        {entry.parseError && (
-          <span className="ml-2 text-destructive/80 text-[11px]">{entry.parseError}</span>
-        )}
+        {entry.status === 'idle' && <span className="ml-2 text-xs text-muted-foreground">waiting…</span>}
+        {firstError && <p className="mt-0.5 text-xs text-destructive/90">{firstError}</p>}
         {entry.result?.server_data.detail && (
-          <span className="ml-2 font-mono text-[10px] text-muted-foreground">
-            → {entry.result.server_data.detail}
-          </span>
+          <p className="mt-0.5 font-mono text-xs text-muted-foreground">→ {entry.result.server_data.detail}</p>
         )}
-      </TableCell>
-      <TableCell className="text-center">
+      </td>
+      <td className="px-3 py-2.5 text-center">
         <CheckIcon check={entry.result?.socks5} testing={testing} />
-      </TableCell>
-      <TableCell className="text-center">
+      </td>
+      <td className="px-3 py-2.5 text-center">
         <CheckIcon check={entry.result?.server_data} testing={testing} />
-      </TableCell>
-      <TableCell className="text-center">
+      </td>
+      <td className="px-3 py-2.5 text-center">
         <CheckIcon check={entry.result?.enet} testing={testing} />
-      </TableCell>
-    </TableRow>
+      </td>
+    </tr>
   )
 }

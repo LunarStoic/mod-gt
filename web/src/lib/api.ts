@@ -56,7 +56,8 @@ export type BotStatus =
   | "server_overloaded"
   | "too_many_logins"
   | "update_required"
-  | "maintenance";
+  | "maintenance"
+  | "stopped";
 
 export interface BotSummary {
   id: number;

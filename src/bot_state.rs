@@ -20,6 +20,8 @@ pub enum BotStatus {
     UpdateRequired,
     /// Server is under maintenance. Retrying after 600 s.
     Maintenance,
+    /// Saved bot restored at startup that waits for a manual Reconnect (no network activity yet).
+    Stopped,
 }
 
 impl fmt::Display for BotStatus {
@@ -33,6 +35,7 @@ impl fmt::Display for BotStatus {
             BotStatus::TooManyLogins    => write!(f, "too_many_logins"),
             BotStatus::UpdateRequired   => write!(f, "update_required"),
             BotStatus::Maintenance      => write!(f, "maintenance"),
+            BotStatus::Stopped          => write!(f, "stopped"),
         }
     }
 }

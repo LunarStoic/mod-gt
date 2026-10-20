@@ -86,18 +86,25 @@ impl BotManager {
             proxy: proxy.as_ref().map(SavedProxy::from_config),
             settings: None,
         });
-        self.spawn_ltoken_with_key(ltoken_str, proxy, key)
+        self.spawn_ltoken_with_key(ltoken_str, proxy, key, false)
     }
 
     /// Re-creates the bots saved by a previous run (called once at startup).
+    /// By default they wait ("stopped") until the user presses Reconnect, so a restart does not make
+    /// every bot log in at once from the same IP. Set MORI_AUTOSTART=1 to connect them at startup.
     pub fn restore_saved(&mut self) {
         let saved = crate::bot_store::load();
+        let autostart = std::env::var("MORI_AUTOSTART").map(|v| v == "1").unwrap_or(false);
         if !saved.is_empty() {
-            println!("[BotStore] restoring {} saved bot(s)", saved.len());
+            println!(
+                "[BotStore] restoring {} saved bot(s) ({})",
+                saved.len(),
+                if autostart { "connecting now" } else { "waiting for a manual Reconnect" }
+            );
         }
         for bot in saved {
             let proxy = bot.proxy.as_ref().and_then(SavedProxy::to_config);
-            self.spawn_ltoken_with_key(bot.ltoken, proxy, bot.key);
+            self.spawn_ltoken_with_key(bot.ltoken, proxy, bot.key, !autostart);
         }
     }
 
@@ -106,6 +113,7 @@ impl BotManager {
         ltoken_str: String,
         proxy: Option<Socks5Config>,
         key: String,
+        paused: bool,
     ) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -114,7 +122,7 @@ impl BotManager {
         let stop_clone = stop_flag.clone();
 
         let state = Arc::new(RwLock::new(BotState {
-            status: BotStatus::Connecting,
+            status: if paused { BotStatus::Stopped } else { BotStatus::Connecting },
             ..Default::default()
         }));
         let state_clone = state.clone();
@@ -127,7 +135,7 @@ impl BotManager {
         let bot_key = key.clone();
         std::thread::spawn(move || {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut bot = crate::bot::Bot::new_ltoken(&ltoken_str, proxy, state_clone, cmd_rx, items_dat, id, Some(ws_tx_clone), Some(bot_key));
+                let mut bot = crate::bot::Bot::new_ltoken(&ltoken_str, proxy, state_clone, cmd_rx, items_dat, id, Some(ws_tx_clone), Some(bot_key), paused);
                 bot.run(stop_clone);
             })) {
                 Ok(_)  => println!("[Bot:{id}] Stopped."),
