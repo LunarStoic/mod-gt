@@ -57,7 +57,7 @@ local FINAL_TAKE_SURFACE_DROPS = false  -- at the very end also pick up what lie
 local DIRT_BATCH     = 190    -- while building, fetch Dirt from the depot until holding this much
 local DIRT_PER_TREE  = 8      -- average Dirt blocks one harvested Dirt tree gives (measured 7-9); the script plants enough trees for the shortfall
 local TREE_MARGIN    = 0.05   -- plant this fraction more trees than the shortfall needs (safety for a low harvest)
-local WALK_DELAY_MS  = 150    -- the bot's wait after each walked tile (Mori default is 500); nil = leave as it is
+local WALK_DELAY_MS  = 100  -- the bot's wait after each walked tile (Mori default is 500); nil = leave as it is
 local MAX_WAIT_S     = 1800   -- do not accept a growth time longer than this
 local FARM_MARGIN_S  = 5      -- extra seconds on top of the grow time (raise to 8-10 if trees get punched too early)
 local MAX_FARM_ROUNDS = 30
@@ -68,7 +68,7 @@ local MAX_SOFT       = 40     -- connection-type failures in a row before the sc
 local GUARD_EVERY    = 12     -- full connection check every this many ticks (a dropped connection is seen at once)
 local AVOID          = { [6] = true, [8] = true }   -- main door, bedrock: never hit
 local MAX_PUNCH      = 12     -- punches per attempt (block and background together)
-local PLACE_DELAY_MS = 100    -- the bot's own delay after each hit/place
+local PLACE_DELAY_MS = 80  -- the bot's own delay after each hit/place
 local COLLECT_TILES  = 5      -- pickup radius in tiles
 local MAX_TRIES      = 2      -- give up on an object after this many pickup attempts
 local FULL_MARGIN    = 3      -- the backpack counts as full with this many free slots left or fewer
@@ -76,6 +76,23 @@ local LOCK_IDS       = { 242, 1796, 7188, 11550 }   -- World Lock, Diamond Lock,
 local KEEP           = { [18] = true, [32] = true, [98] = true, [112] = true, [2] = true, [3] = true }
                               -- never dropped completely: fist, wrench, pickaxe, gems, Dirt, Dirt Seed (+ the locks above)
 for _, id in ipairs(LOCK_IDS) do KEEP[id] = true end
+-- Worn items (isActive) and everything that can be worn (clothing_type ~= 0, action type 20 = clothes) and every
+-- pickaxe are NEVER dropped or trashed either, whatever the item.
+local keepCache = {}
+local function keepItem(id)
+  if KEEP[id] then return true end
+  local c = keepCache[id]
+  if c == nil then
+    c = false
+    local info = getInfo(id)
+    if info then
+      if (info.clothing_type or 0) ~= 0 or info.action_type == 20 then c = true end
+      if info.name and info.name:lower():find("pickaxe", 1, true) then c = true end
+    end
+    keepCache[id] = c
+  end
+  return c
+end
 -- RULE: this script NEVER calls trash(). Items in KEEP are never trashed and never dropped (only the part of
 -- Dirt / Dirt Seed above the 200 stack cap, minus the reserve, is dropped beside the main door, see dropAmount).
 local DOOR_SPOT_DX   = 2      -- drop this many tiles beside the main door (shifts a bit on every trip)
@@ -130,17 +147,31 @@ local function tick()
   guard()
 end
 
-local havePickaxe = USE_PICKAXE and getInventory():findItem(PICKAXE_ID) > 0
+-- Any pickaxe in the backpack will do (every item whose name contains "pickaxe"). Returns its id and whether it is worn.
+local function findPickaxe()
+  local first
+  for _, it in ipairs(getInventory():getItems()) do
+    local info = getInfo(it.id)
+    if info and info.name and info.name:lower():find("pickaxe", 1, true) then
+      if it.isActive then return it.id, true end
+      first = first or it.id
+    end
+  end
+  return first, false
+end
+
 local pickaxeGaveUp = false
 local function ensurePickaxe()
-  if not havePickaxe or pickaxeGaveUp then return end
+  if not USE_PICKAXE or pickaxeGaveUp then return end
   tick()
-  if pickaxeOn then return end
+  local id, worn = findPickaxe()
+  if not id or worn then return end              -- no pickaxe at all, or one is already worn
   for attempt = 1, 2 do
-    bot:wear(PICKAXE_ID)
+    bot:wear(id)
     for i = 1, 20 do
       listenEvents(0.25)
-      if pickaxeOn then return end
+      local _, nowWorn = findPickaxe()
+      if pickaxeOn or nowWorn then return end
     end
   end
   pickaxeGaveUp = true
@@ -462,7 +493,7 @@ local function collectAll(minY, only)
           bot:collectObject(o.oid, COLLECT_TILES)   -- the range argument is in TILES
           collected = collected + 1
           tick()
-        elseif not KEEP[o.id] then
+        elseif not keepItem(o.id) then
           needDrop = true                           -- something else could not be picked up: backpack is full
         end
       end
@@ -481,7 +512,8 @@ end
 
 -- How much of a stack is dropped at the door.
 local function dropAmount(it)
-  if not KEEP[it.id] then return it.count end                      -- everything else goes
+  if it.isActive then return 0 end                                  -- worn right now: never
+  if not keepItem(it.id) then return it.count end                   -- everything else goes
   if it.id == DIRT_ID and it.count >= STACK_CAP then return it.count - DIRT_RESERVE end
   if it.id == SEED_ID and it.count >= STACK_CAP then
     return it.count - (buildRemaining() and SEED_RESERVE or 0)
@@ -529,8 +561,56 @@ local function fillLava()
   return true
 end
 
+-- ===== Back to the door: respawn (the server puts the bot on the white door), no long walk =====
+local USE_RESPAWN = true          -- false = always walk to the door
+-- Respawns and waits until the bot stands at the white door; returns false when the position did not change.
+local function respawnToDoor()
+  if not USE_RESPAWN or not doorFound then return false end
+  local bx, by = botTile()
+  if math.abs(bx - doorX) <= 2 and math.abs(by - doorY) <= 1 then return true end   -- already there
+  bot:respawn()
+  for i = 1, 25 do                               -- up to ~5 s for the server to move us
+    listenEvents(0.2)
+    adv(200)
+    guard()
+    bx, by = botTile()
+    if math.abs(bx - doorX) <= 2 and math.abs(by - doorY) <= 1 then return true end
+  end
+  print("Respawn did not bring the bot to the door (bot at " .. bx .. "," .. by .. "), walking instead")
+  return false
+end
+
+-- Gets the bot beside the door at spotX: respawn first, then the few tiles to the spot (or the whole walk).
+-- The last step is always one tile to the RIGHT so the bot faces right, toward open ground ("You can't drop that
+-- here, face somewhere with open space" appears when the tile in front is blocked).
+local function goToDoorSpot(spotX)
+  respawnToDoor()
+  if not goTo(spotX - 1, doorY) then return false end
+  return goTo(spotX, doorY)
+end
+
 -- ===== Empty the backpack beside the main door, then return =====
 local trips = 0
+
+-- Drops `count` of item `id` where the bot stands. When the game refuses (blocked tile in front), the bot moves a
+-- few tiles further along the door row, facing right again, and tries once more.
+local function dropOne(id, count)
+  for attempt = 1, 6 do
+    local before = getInventory():findItem(id)
+    if before <= 0 then return true end
+    bot:fastDrop(id, math.min(count, before))
+    listenEvents(0.3)
+    if getInventory():findItem(id) < before then return true end
+    bot:drop(id, math.min(count, before))
+    listenEvents(0.6)
+    if getInventory():findItem(id) < before then return true end
+    local sx = math.min(doorX + DOOR_SPOT_DX + attempt * 2 + (trips % 6), WORLD_W - 2)
+    print("Could not drop " .. itemName(id) .. " here, moving to " .. sx .. "," .. doorY .. " (try " .. attempt .. ")")
+    goTo(sx - 1, doorY)
+    goTo(sx, doorY)
+  end
+  return false
+end
 local function emptyBackpack()
   local sx, sy = botTile()
   trips = trips + 1
@@ -538,7 +618,7 @@ local function emptyBackpack()
   print("Backpack full, walking to the main door to drop items (trip " .. trips .. ")")
   local atDoor = false
   for try = 1, 3 do                              -- repeated because a reconnect on the way resets the position
-    if goTo(spotX, doorY) then
+    if goToDoorSpot(spotX) then
       local bx, by = botTile()
       if math.abs(bx - spotX) <= 1 and by == doorY then atDoor = true break end
     end
@@ -551,12 +631,8 @@ local function emptyBackpack()
     if amount > 0 then stacks[#stacks + 1] = { id = it.id, count = amount } end
   end
   for _, s in ipairs(stacks) do
-    local before = getInventory():findItem(s.id)
-    bot:fastDrop(s.id, s.count)
-    listenEvents(0.3)
-    if getInventory():findItem(s.id) >= before then      -- fast drop did not work: use the normal drop dialog
-      bot:drop(s.id, s.count)
-      listenEvents(0.6)
+    if not dropOne(s.id, s.count) then
+      print("Could not drop " .. itemName(s.id) .. " anywhere along the door row, keeping it.")
     end
   end
   listenEvents(0.5)
@@ -684,6 +760,7 @@ end
 -- holds wantSeeds seeds (nil = no seeds wanted), or nothing more can be taken.
 local function gatherDepot(wantSeeds)
   tried = {}
+  respawnToDoor()                                -- the depot lies beside the door: jump there instead of walking
   for round = 1, 80 do
     local inv = getInventory()
     local want = {}
@@ -759,18 +836,15 @@ local function depositDirt()
   local spotX = math.min(doorX + DOOR_SPOT_DX + (trips % 6), WORLD_W - 1)
   local atDoor = false
   for try = 1, 3 do
-    if goTo(spotX, doorY) then
+    if goToDoorSpot(spotX) then
       local bx, by = botTile()
       if math.abs(bx - spotX) <= 1 and by == doorY then atDoor = true break end
     end
   end
   if not atDoor then return false, "Could not walk to the main door at " .. spotX .. "," .. doorY .. "." end
   local before = getInventory():findItem(DIRT_ID)
-  bot:fastDrop(DIRT_ID, before)
-  listenEvents(0.3)
-  if getInventory():findItem(DIRT_ID) >= before then
-    bot:drop(DIRT_ID, before)
-    listenEvents(0.6)
+  if not dropOne(DIRT_ID, before) then
+    return false, "Could not put the Dirt in the depot: the game refused every drop spot along the door row."
   end
   listenEvents(0.3)
   needDrop = false
